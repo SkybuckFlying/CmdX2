@@ -1,0 +1,6 @@
+*.o
+*.ppu
+*.exe
+cmdx2
+TestCmdX2
+test_win64
