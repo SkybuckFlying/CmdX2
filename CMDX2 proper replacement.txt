@@ -1,0 +1,934 @@
+================================================================
+CMDX2 - FUNCTIONAL SPECIFICATION
+A cmd.exe-compatible shell that removes the PATH length limit
+Version 2.0
+Clean-room design. Derived from public documentation and
+observable behavior only. No proprietary or leaked source
+was consulted in the preparation of this document.
+================================================================
+
+
+TABLE OF CONTENTS
+
+  1  Purpose and Philosophy
+  2  Non-Goals
+  3  Architecture Overview
+  4  Configuration and PATH Storage
+  5  The In-Memory PATH
+  6  Command Resolution
+  7  Environment Block Construction
+  8  The CreateProcessW Ceiling
+  9  Empirical Measurement of the Ceiling
+ 10  Fallback Strategies
+ 11  Diagnostics and Introspection
+ 12  Batch File Compatibility
+ 13  Built-In Commands
+ 14  Session Model
+ 15  Error Handling
+ 16  Testing Strategy
+ 17  Acceptance Criteria
+ 18  Implementation Notes for Delphi
+
+
+================================================================
+1  PURPOSE AND PHILOSOPHY
+================================================================
+
+1.1 The problem CmdX2 exists to solve
+
+Windows stores the system PATH in the registry, where it is
+truncated around 4095 characters. The legacy cmd.exe additionally
+ignores any inherited environment variable longer than 8191
+characters after expansion. Because installers append their
+directories to PATH without any central coordination, PATH grows
+without bound until one of those limits is hit. At that point,
+commands stop being found by name, and the user is forced to type
+full paths or manually prune PATH.
+
+Variable substitution with %VAR% does not solve this. cmd.exe
+expands all variables before it checks the length, so a short
+stored representation becomes a long runtime representation and
+is discarded anyway.
+
+1.2 The CmdX2 position
+
+CmdX2 does not accept this as a fact of life. The limits belong
+to cmd.exe and to the registry storage model, not to Windows
+itself and not to the command line as a concept. A shell that
+stores PATH in its own configuration, holds it in memory as an
+ordinary string, resolves commands with its own code, and
+constructs its own environment blocks for child processes is not
+subject to either limit.
+
+1.3 The design target
+
+A user should be able to maintain a PATH of tens of thousands
+of characters, containing hundreds of tool directories, and
+CmdX2 should find and execute every tool on it without
+complaint, truncation, or silent failure. The system PATH in
+the registry can remain whatever it already is. CmdX2 does not
+ask Windows to change. It simply stops using the parts of
+Windows that impose the limit.
+
+1.4 The one limit CmdX2 cannot remove
+
+The environment block passed to CreateProcessW has some maximum
+size determined by Windows itself. This ceiling is not clearly
+documented and may vary between Windows versions. CmdX2 must
+measure it empirically on the host system, report it to the
+user, and handle it gracefully when it is reached. See
+Sections 8 through 10.
+
+
+================================================================
+2  NON-GOALS
+================================================================
+
+2.1 CmdX2 does not modify the registry PATH.
+
+2.2 CmdX2 does not require or encourage the user to shorten the
+    system PATH. It works regardless of what the system PATH
+    contains.
+
+2.3 CmdX2 does not replace cmd.exe as the system default shell.
+    It is an alternative shell the user invokes when they want
+    it.
+
+2.4 CmdX2 does not attempt binary compatibility with cmd.exe
+    internals or with undocumented Windows 9x behavior.
+
+2.5 CmdX2 does not guarantee that every child program will
+    accept a long PATH. Some programs perform their own PATH
+    parsing and impose their own limits. CmdX2 provides
+    diagnostics to identify such programs (Section 11) but
+    cannot fix them.
+
+
+================================================================
+3  ARCHITECTURE OVERVIEW
+================================================================
+
+3.1 Components
+
+  A  Console I/O Layer
+     Reads keystrokes with ReadConsoleInput. Renders the prompt
+     and the input line. Handles editing keys, history, and
+     completion.
+
+  B  Lexer and Parser
+     Tokenizes a command line into a command, arguments,
+     redirections, and operators.
+
+  C  Expansion Engine
+     Performs percent expansion, delayed expansion, caret
+     escaping, and batch argument substitution.
+
+  D  PATH Manager
+     Loads PATH from configuration, holds it in memory, merges
+     multiple sources, deduplicates, and exposes it to the
+     resolver and to child process construction.
+
+  E  Command Resolver
+     Given a command name, finds the executable. Uses the
+     in-memory PATH and PATHEXT. Does not call SearchPathW.
+     Does not consult the registry PATH.
+
+  F  Environment Builder
+     Constructs the environment block passed to CreateProcessW.
+     Contains the full, long PATH.
+
+  G  Executor
+     Decides between built-in and external command. Manages
+     redirection, pipes, and process creation. Sets errorlevel.
+
+  H  Ceiling Probe
+     Empirically measures the CreateProcessW environment block
+     ceiling on the host system. Caches the result. Invoked on
+     demand or at first use.
+
+  I  Diagnostics
+     Reports PATH length, entry count, the measured ceiling,
+     which entries are reachable, and which child programs
+     fail with long environments.
+
+3.2 Execution model
+
+CmdX2 runs a read-eval-print loop. Each iteration reads a
+logical line, expands it, parses it, executes it, and stores
+the errorlevel. Batch files execute in a nested context.
+
+3.3 The central invariant
+
+CmdX2 never truncates PATH. It never silently drops an entry.
+It never refuses to run a command because PATH is long. If a
+limit is reached, the user is told exactly what was attempted,
+what failed, and what the options are.
+
+
+================================================================
+4  CONFIGURATION AND PATH STORAGE
+================================================================
+
+4.1 Where PATH lives
+
+PATH is stored in CmdX2's own configuration files, not in the
+registry, and not in the system environment variable. CmdX2
+never reads the registry PATH for its own resolution. It may
+read it once at startup to offer the user an import, but it
+does not depend on it.
+
+4.2 Configuration file locations
+
+  Global:      %APPDATA%\CmdX2\config.toml
+  Machine:     %PROGRAMDATA%\CmdX2\config.toml
+  Project:     ./.cmdx2/config.toml
+  Session:     specified with --config PATH on the command line
+
+4.3 Merge order
+
+  Session  overrides  Project  overrides  Machine  overrides  Global
+
+For PATH specifically, entries are merged by concatenation with
+deduplication. Order is preserved: entries from higher priority
+sources appear first. The user can configure whether lower
+priority sources are appended or discarded.
+
+4.4 File format
+
+TOML is the preferred format. The relevant sections are:
+
+  [path]
+  entries = [
+    "C:\\Tools\\Python312",
+    "C:\\Tools\\Python312\\Scripts",
+    "C:\\Tools\\Git\\cmd",
+    "C:\\Tools\\Git\\bin",
+    "C:\\Tools\\Rust\\bin",
+    ...
+  ]
+  append_system = true
+  deduplicate = true
+  normalize = true
+
+  [pathext]
+  extensions = [".COM", ".EXE", ".BAT", ".CMD", ".PS1", ".VBS"]
+
+  [probe]
+  enabled = true
+  cached_ceiling = 0
+
+4.5 No length limit in configuration
+
+The configuration file is an ordinary file on disk. It has no
+artificial length limit. A PATH list of ten thousand entries
+is a perfectly valid configuration.
+
+4.6 Import from system PATH
+
+CmdX2 provides 'cmdx2 import' which reads the current system
+and user PATH from the registry and writes them into the
+global configuration file. After import, the user is free to
+remove the registry entries if they wish, or to leave them.
+CmdX2 does not require or perform that removal.
+
+
+================================================================
+5  THE IN-MEMORY PATH
+================================================================
+
+5.1 Representation
+
+PATH is held in memory as a single Delphi UnicodeString,
+delimiter-separated with semicolons. UnicodeString supports
+lengths up to approximately 2^30 characters. The practical
+limit is available memory. CmdX2 imposes no artificial limit
+below this.
+
+5.2 Why a single string
+
+A single string matches the shape of the environment variable
+that children expect, simplifies serialisation into the
+environment block, and avoids any temptation to impose a
+per-entry or total-entry limit during parsing.
+
+5.3 Normalisation
+
+On load, CmdX2 may perform the following optional operations,
+each controlled by configuration:
+
+  - Trailing backslashes are stripped (except on drive roots).
+  - Duplicate entries are removed, keeping the first occurrence.
+  - Entries are compared case-insensitively for deduplication.
+  - Relative entries are not resolved, because the meaning of
+    a relative PATH entry is defined by each child's working
+    directory, not by CmdX2's.
+
+Normalisation is an optimisation. The user's configuration is
+never modified by it.
+
+5.4 Display
+
+'cmdx2 path' prints the PATH with one entry per line, numbered,
+with a note of the source file for each entry. 'cmdx2 path
+--raw' prints the raw semicolon-delimited string. 'cmdx2 path
+--length' prints the character count, the entry count, and the
+measured child environment ceiling.
+
+
+================================================================
+6  COMMAND RESOLUTION
+================================================================
+
+6.1 The resolver does not call SearchPathW
+
+The Win32 SearchPathW function has its own internal limits and
+its own behaviour with respect to the system PATH. CmdX2 does
+not use it. CmdX2 implements its own resolver so that the
+resolution logic is entirely under our control and entirely
+free of legacy ceilings.
+
+6.2 Resolution algorithm
+
+Given a command name N and the in-memory PATH P:
+
+  1. If N contains a path separator or a drive letter, treat N
+     as an explicit path and resolve it directly, applying
+     PATHEXT only if no extension is present. Do not search P.
+
+  2. If N begins with a recognised shell prefix (./ or .\),
+     resolve relative to the current directory.
+
+  3. If N is a built-in command, execute it. Built-ins take
+     precedence over external programs of the same name.
+
+  4. If N has an extension in PATHEXT, search each entry of P
+     in order for a file named N. The first match wins.
+
+  5. If N has no extension, search each entry of P in order for
+     a file named N followed by each PATHEXT extension in order.
+     The first match wins.
+
+  6. If no match is found, report the command as not found and
+     set errorlevel 9009.
+
+6.3 Case sensitivity
+
+File lookups on Windows are case-insensitive. The resolver
+compares names case-insensitively.
+
+6.4 Caching
+
+The resolver may cache the mapping from command name to
+resolved path within a session, invalidated when PATH changes.
+The cache has no size limit.
+
+6.5 No fallback to registry PATH
+
+If a command is not found in the in-memory PATH, CmdX2 does
+not silently fall back to the registry PATH. The in-memory
+PATH is authoritative. This is what makes the design
+predictable.
+
+
+================================================================
+7  ENVIRONMENT BLOCK CONSTRUCTION
+================================================================
+
+7.1 Purpose
+
+Every child process receives a freshly constructed environment
+block. CmdX2 never passes its own inherited environment block
+directly, because the inherited block may already have been
+truncated by the system before CmdX2 started.
+
+7.2 Construction
+
+Given the current session environment E (a name-to-value map,
+case-insensitive) and the in-memory PATH P:
+
+  1. Copy E into a new map.
+  2. Set the PATH entry of the copy to the full value of P.
+  3. Serialise the map as a sequence of null-terminated
+     strings of the form NAME=VALUE, in a stable order
+     (sorted case-insensitively by name is recommended).
+  4. Terminate the sequence with an additional null character.
+  5. Encode as UTF-16LE.
+
+7.3 Passing to CreateProcessW
+
+The serialised block is passed as lpEnvironment to
+CreateProcessW, with bInheritHandles set as required by the
+redirection strategy in use. The block is freed after
+CreateProcessW returns.
+
+7.4 No truncation
+
+CmdX2 does not truncate the block. It does not shorten PATH to
+fit an assumed limit. If the block is too large for
+CreateProcessW, the failure is detected and reported (Section
+8), not pre-empted by silent trimming.
+
+7.5 Stable ordering
+
+The order of variables in the block is stable across calls so
+that the size of the block is predictable and so that
+diagnostics can compare blocks between runs.
+
+
+================================================================
+8  THE CREATEPROCESSW CEILING
+================================================================
+
+8.1 Statement of the unknown
+
+The environment block accepted by CreateProcessW has a maximum
+size. This maximum is not clearly documented by Microsoft and
+may differ between Windows versions, editions, and
+configurations. CmdX2 does not assume a value. It measures the
+value on the host system.
+
+8.2 Why this matters
+
+If CmdX2 simply assumed the limit were large and it turned out
+not to be, then at some PATH length the child launch would
+fail, and without measurement the failure would be mysterious.
+If CmdX2 assumed the limit were small and trimmed PATH to fit,
+it would defeat the entire purpose of the project. The only
+correct approach is to measure, report, and then decide.
+
+8.3 What is measured
+
+The probe measures the largest environment block that
+CreateProcessW will accept on the current system, expressed in
+bytes, when launching a trivial child process. The result is
+cached in the configuration file.
+
+8.4 When the probe runs
+
+  - On demand, via 'cmdx2 limits --probe'.
+  - At first launch of a child process, if no cached value is
+    present and probing is enabled.
+  - Never automatically if probing is disabled in the
+    configuration.
+
+8.5 Cost
+
+The probe takes a small amount of time, typically under one
+second, because it launches a trivial child repeatedly with
+blocks of increasing size. The result is cached, so the cost
+is paid once per system or per configuration change.
+
+
+================================================================
+9  EMPIRICAL MEASUREMENT OF THE CEILING
+================================================================
+
+9.1 Probe algorithm
+
+  1. Construct a base environment block containing only the
+     minimum required variables (SystemRoot, SystemDrive,
+     TEMP, TMP, PATH set to a short fixed value). Record its
+     size as B0.
+
+  2. Attempt to launch a trivial child (for example,
+     cmd.exe /c exit) with this block. If it fails, the probe
+     cannot run on this system, and CmdX2 falls back to a
+     conservative default (Section 9.5) and reports that the
+     probe was inconclusive.
+
+  3. Append a filler variable of increasing size to the block
+     and attempt to launch again. Use exponential growth
+     followed by binary search:
+
+       low  = B0
+       high = B0
+       while launch succeeds with block of size high:
+           low  = high
+           high = high * 2
+           if high exceeds a safety bound (see 9.4), stop and
+               report the largest successful size found.
+
+       Then binary search between low and high to find the
+       exact ceiling, to a resolution of 1 kilobyte.
+
+  4. Record the largest block size that succeeded, in bytes.
+
+  5. Write the value to the configuration file under
+     [probe] cached_ceiling.
+
+9.2 Filler content
+
+The filler is a variable named CMDX2_PROBE_FILLER whose value
+is a long string of 'A' characters. The name is chosen so that
+it cannot collide with a real environment variable. CmdX2
+removes it from every block after the probe.
+
+9.3 Safety bound
+
+The probe stops at 64 megabytes regardless of success, to
+avoid pathological behaviour on systems with unusual limits.
+If the probe reaches this bound without failing, CmdX2
+records "greater than 64 MB" and treats the ceiling as
+effectively unlimited for practical purposes.
+
+9.4 Reporting
+
+'cmdx2 limits' prints:
+
+  Measured child environment ceiling:  <N> bytes
+  In-memory PATH length:               <P> bytes
+  Headroom:                            <N - P> bytes
+  Status:                              OK / WARNING / EXCEEDED
+
+  WARNING is printed when headroom is below 10% of the ceiling.
+  EXCEEDED is printed when PATH exceeds the ceiling.
+
+9.5 Conservative default when probing fails
+
+If the probe cannot run, CmdX2 assumes a ceiling of 32767
+characters (65534 bytes), which is the documented maximum for
+a single environment variable in the Win32 API. This is a
+conservative floor, not a claim about the true ceiling.
+
+9.6 Re-probing
+
+The user can force a re-probe with 'cmdx2 limits --probe
+--force'. CmdX2 re-probes automatically if the Windows build
+number changes.
+
+
+================================================================
+10  FALLBACK STRATEGIES
+================================================================
+
+10.1 When the ceiling is approached
+
+CmdX2 monitors the size of the environment block it is about
+to pass to CreateProcessW. If the size exceeds a configurable
+threshold (default 90% of the measured ceiling), CmdX2 takes
+action before attempting the launch.
+
+10.2 Strategy A - Warn and proceed
+
+The default. CmdX2 prints a warning naming the block size and
+the ceiling, then attempts the launch anyway. If the launch
+fails, the failure is reported with the same information.
+
+10.3 Strategy B - Trim to the entries used in this session
+
+CmdX2 tracks which PATH entries have actually been used to
+resolve commands during the current session. If the block is
+too large, CmdX2 can construct a reduced PATH containing only
+those entries, plus a small set of always-included entries
+configured by the user. The original PATH is unchanged; only
+the child block is reduced. The user is told which entries
+were omitted.
+
+This strategy is opt-in. It is not the default, because it
+changes the child's environment in a way the user did not
+explicitly request.
+
+10.4 Strategy C - Use a shim directory
+
+CmdX2 can maintain a shim directory containing symbolic links
+or small wrapper executables for every command found in PATH.
+The shim directory is short and its path fits easily within
+any ceiling. Children that need to run a command by name
+receive the shim directory on PATH instead of the full PATH.
+The full PATH is still available to CmdX2 itself for
+resolution.
+
+This strategy is opt-in and is best suited to users whose
+PATH is dominated by a small number of frequently used tools.
+
+10.5 Strategy D - Refuse and explain
+
+If the user has configured CmdX2 to be strict, it refuses to
+launch the child and prints a detailed report: the block size,
+the ceiling, the largest contributing entries, and the
+available strategies. The user chooses what to do.
+
+10.6 No silent truncation, ever
+
+Under no circumstances does CmdX2 silently drop entries from
+PATH to fit the block. Every reduction is reported. This is
+the central promise of the project.
+
+
+================================================================
+11  DIAGNOSTICS AND INTROSPECTION
+================================================================
+
+11.1 'cmdx2 limits'
+
+Prints the measured ceiling, the current PATH size, the
+headroom, and the status.
+
+11.2 'cmdx2 path'
+
+Prints PATH with one entry per line, numbered, with source
+annotations. Options: --raw, --length, --duplicates.
+
+11.3 'cmdx2 which <command>'
+
+Prints the full path of the executable that CmdX2 would run
+for <command>, and which PATH entry it was found in, and
+which PATHEXT extension matched.
+
+11.4 'cmdx2 diagnose <command>'
+
+Launches <command> with the current environment and reports
+whether it succeeded. If it failed with an environment-related
+error, reports the block size and the ceiling.
+
+11.5 'cmdx2 env-dump'
+
+Prints the exact environment block that CmdX2 would pass to a
+child, one variable per line, with sizes. Useful for
+reproducing a failure in another tool.
+
+11.6 'cmdx2 probe'
+
+Runs the ceiling probe and prints the result. Equivalent to
+'cmdx2 limits --probe'.
+
+11.7 Logging
+
+All diagnostics can be written to a log file with --log PATH.
+The log includes timestamps, block sizes, ceilings, and
+launch results.
+
+
+================================================================
+12  BATCH FILE COMPATIBILITY
+================================================================
+
+12.1 Scope
+
+CmdX2 executes .bat and .cmd files with syntax compatible with
+cmd.exe, as documented in the public command reference. The
+full grammar, expansion rules, and built-in command set are
+specified in the companion document CMDX2-BATCH-SPEC, which is
+maintained separately. Section 13 of this document lists the
+built-ins for completeness.
+
+12.2 Deliberate divergences
+
+The following divergences from cmd.exe are deliberate and are
+documented for the user:
+
+  - The 8191-character environment limit does not apply.
+  - The 4095-character registry PATH limit does not apply.
+  - The for /f tokeniser follows the documented behavior but
+    does not reproduce undocumented quirks that have no
+    defined behavior in the public documentation.
+
+12.3 Compatibility testing
+
+A regression corpus of public batch files is executed under
+both cmd.exe and CmdX2, and the outputs are compared. Any
+difference is either a documented divergence or a bug.
+
+
+================================================================
+13  BUILT-IN COMMANDS
+================================================================
+
+13.1 The full set, matching cmd.exe names
+
+  Directory and file:
+    dir, cd, chdir, md, mkdir, rd, rmdir, del, erase,
+    copy, xcopy, move, ren, rename, type, more
+
+  Environment and shell:
+    set, path, prompt, title, color, cls, ver, vol,
+    date, time, pause, exit, echo, shift, call, goto,
+    start, assoc, ftype, setlocal, endlocal, pushd, popd
+
+  Conditional and loop:
+    if, else, for
+
+  Comment and no-op:
+    rem, ::
+
+13.2 New built-ins specific to CmdX2
+
+  cmdx2 limits       Report ceiling and headroom.
+  cmdx2 path         Report PATH with sources.
+  cmdx2 which        Resolve a command.
+  cmdx2 diagnose     Test a command under the current env.
+  cmdx2 env-dump     Print the child environment block.
+  cmdx2 probe        Run the ceiling probe.
+  cmdx2 import       Import registry PATH into config.
+  cmdx2 reload       Reload configuration and re-merge PATH.
+
+These names do not collide with any cmd.exe built-in.
+
+13.3 Behaviour
+
+Each built-in follows the cmd.exe behavior described in the
+public command reference, with the divergences in Section 12.2.
+
+
+================================================================
+14  SESSION MODEL
+================================================================
+
+14.1 Session state
+
+A session holds:
+
+  - The current environment map (name to value).
+  - The current in-memory PATH.
+  - The current working directory and drive.
+  - The current errorlevel.
+  - The setlocal stack.
+  - The batch context stack.
+  - The resolver cache.
+  - The measured ceiling (shared across sessions).
+  - The list of PATH entries used in this session (for
+    Strategy B, Section 10.3).
+
+14.2 Lifetime
+
+A session begins when CmdX2 starts and ends when it exits.
+Changes made with 'set' affect only the session. They do not
+persist unless the user runs a command to save them.
+
+14.3 Persistence
+
+'cmdx2 path --save' writes the current PATH to the
+configuration file. 'cmdx2 path --save --global' writes it to
+the global configuration. There is no implicit persistence.
+
+14.4 Reloading
+
+'cmdx2 reload' re-reads all configuration files, re-merges
+PATH, invalidates the resolver cache, and reports the new
+sizes. The session environment other than PATH is unchanged.
+
+
+================================================================
+15  ERROR HANDLING
+================================================================
+
+15.1 Command not found
+
+  'name' is not recognized as an internal or external command,
+  operable program or batch file.
+  Errorlevel 9009.
+
+15.2 Environment block too large
+
+  The environment block for '<command>' is <N> bytes, which
+  exceeds the measured ceiling of <C> bytes on this system.
+  PATH contributes <P> bytes.
+  Options:
+    - Run 'cmdx2 path' to review PATH entries.
+    - Run 'cmdx2 limits --probe' to re-measure the ceiling.
+    - Enable Strategy B or C in config.toml (see docs).
+  Errorlevel 9008.
+
+15.3 Configuration file malformed
+
+  Configuration file <path> could not be parsed:
+  <parser error>
+  Errorlevel 9007.
+
+15.4 Probe inconclusive
+
+  The environment ceiling could not be measured on this
+  system. Assuming a conservative default of 65534 bytes.
+  Run 'cmdx2 limits --probe --force' to retry.
+  Errorlevel 9006 (warning, not fatal).
+
+15.5 Batch file errors
+
+  Match cmd.exe messages where compatibility matters.
+  Otherwise, add a CmdX2-specific hint.
+
+
+================================================================
+16  TESTING STRATEGY
+================================================================
+
+16.1 Unit tests
+
+  - Parser: every token, every quoting combination.
+  - Expansion: every documented form of %VAR% and !VAR!.
+  - Resolver: every PATHEXT extension, every ordering rule.
+  - Env builder: serialisation round-trip, null termination,
+    UTF-16 encoding, stable ordering.
+  - Probe: exponential growth, binary search, safety bound,
+    conservative default.
+
+16.2 Integration tests
+
+  - Launch a child with a 100 KB PATH and verify success.
+  - Launch a child with a 1 MB PATH and verify success or a
+    clean, reported failure.
+  - Pipes, redirection, and the && || & operators.
+  - Batch files with goto, call, setlocal, nested loops.
+  - Configuration merge from all four sources.
+
+16.3 Regression corpus
+
+  A set of public batch files, run under both cmd.exe and
+  CmdX2, with output compared byte for byte. Differences are
+  either documented divergences or bugs.
+
+16.4 PATH stress test
+
+  Construct a session with a PATH of 10,000 entries totalling
+  roughly 500 KB. Verify that:
+
+    - CmdX2 starts and reports the size correctly.
+    - Resolution of a command in the middle of the list works.
+    - A child process launches with the full PATH if the
+      ceiling permits, or fails with the documented error if
+      it does not.
+    - No entry is silently dropped.
+
+16.5 Ceiling probe test
+
+  On a known Windows build, run the probe and compare the
+  result against a reference measurement. The probe must be
+  reproducible within 1 KB across runs.
+
+
+================================================================
+17  ACCEPTANCE CRITERIA
+================================================================
+
+CmdX2 is considered complete when:
+
+  1. It executes interactive commands and batch files with
+     syntax compatible with cmd.exe as specified in the
+     companion batch spec.
+
+  2. It stores PATH in its own configuration files and never
+     depends on the registry PATH for its own resolution.
+
+  3. It resolves commands using its own resolver and does not
+     call SearchPathW.
+
+  4. It constructs an environment block for every child
+     containing the full, untruncated in-memory PATH.
+
+  5. It measures the CreateProcessW environment block ceiling
+     empirically on the host system and reports it.
+
+  6. It handles a PATH of at least 500 KB without truncation,
+     either by launching children successfully or by failing
+     with the documented, detailed error.
+
+  7. It never silently drops a PATH entry. Every reduction is
+     reported.
+
+  8. It survives the stress test in Section 16.4.
+
+  9. It passes the regression corpus in Section 16.3, with
+     differences limited to the documented divergences.
+
+ 10. It provides all diagnostics listed in Section 11.
+
+
+================================================================
+18  IMPLEMENTATION NOTES FOR DELPHI
+================================================================
+
+18.1 Project type
+
+Console application. Directive {$APPTYPE CONSOLE}. No VCL, no
+FMX.
+
+18.2 Key units
+
+  Winapi.Windows                  CreateProcessW, console APIs
+  Winapi.Console                  Console mode and screen buffer
+  System.SysUtils                 String handling
+  System.Generics.Collections     TDictionary for environment
+  System.Classes                  TStringList for buffers
+  System.IOUtils                  TFile, TPath for config files
+  System.JSON                     If JSON is preferred over TOML
+  System.IniFiles                 If INI is acceptable for v1
+
+18.3 Key data structures
+
+  TEnvironment = TDictionary<string, string>
+                 Case-insensitive comparer.
+
+  TPathList    = TList<string>     Entries in priority order.
+
+  TSession     = record
+                   Environment : TEnvironment;
+                   Path        : string;   // raw semicolon form
+                   PathEntries : TPathList;
+                   Cwd         : string;
+                   Drive       : Char;
+                   ErrorLevel  : Integer;
+                   SetLocalStack : TStack<TEnvironmentSnapshot>;
+                   BatchStack    : TStack<TBatchContext>;
+                   UsedEntries   : TDictionary<string, Boolean>;
+                 end;
+
+  TLimits      = record
+                   MeasuredCeiling : Int64;  // bytes
+                   ProbeSucceeded  : Boolean;
+                   CachedAt        : TDateTime;
+                   WindowsBuild    : Integer;
+                 end;
+
+18.4 Environment block serialisation
+
+  Allocate with GetMem. Fill with UTF-16LE NAME=VALUE pairs
+  separated by #0. Terminate with an extra #0. Pass as
+  lpEnvironment to CreateProcessW. Free with FreeMem after
+  the call returns.
+
+  Do not use PChar directly on a Delphi string for the block;
+  the block is a sequence of strings, not a single string.
+
+18.5 Ceiling probe
+
+  Use a trivial child such as:
+    CreateProcessW(nil, 'cmd.exe /c exit', ..., block, ...)
+  or, if cmd.exe is not trusted as a probe target, a tiny
+  helper executable shipped with CmdX2 that simply exits.
+
+  The probe must not depend on PATH resolution to find its
+  child, so pass the full path to the probe child.
+
+18.6 Pipes
+
+  Use anonymous pipes via CreatePipe. Start both children
+  concurrently. Close parent-side handles after both are
+  started. Use threads or overlapped I/O. Do not serialise
+  pipeline stages.
+
+18.7 Concurrency
+
+  The console reader runs on its own thread to allow the
+  prompt to redraw while a child runs. Protect shared session
+  state with a critical section.
+
+18.8 Unicode
+
+  Use UTF-16 throughout. Call the W variants of every Win32
+  function. Never call an A variant.
+
+18.9 Error reporting
+
+  Use Format with named arguments where possible. Collect the
+  details of an environment-block failure before raising, so
+  the message can be assembled once and printed once.
+
+18.10 Configuration parsing
+
+  For v1, a hand-written TOML subset parser is acceptable.
+  For v2, use a maintained TOML library. Do not use INI for
+  the PATH list, because INI files have their own length
+  limits in the Windows API and would reintroduce the very
+  problem this project exists to solve.
+
+END OF SPECIFICATION
