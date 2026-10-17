@@ -1,102 +1,122 @@
 unit CmdX2Env;
 
-{$IFDEF FPC}
-  {$MODE DELPHI}
-{$ENDIF}
+{$IFDEF FPC}{$MODE DELPHI}{$ENDIF}
 
 interface
 
 uses
-  SysUtils, Classes, Generics.Defaults, Generics.Collections, CmdX2Types;
+  SysUtils, Classes, Generics.Collections, Windows, CmdX2Types;
 
-procedure LoadCurrentEnvironment(var ASession: TSession);
-function BuildEnvironmentBlockUTF16(const AEnvMap: TEnvironmentMap; out ABlockSize: Int64): Pointer;
+procedure LoadCurrentEnvironment(ASession: TSession);
+function BuildEnvironmentBlockUTF16(const AEnv: TEnvironmentMap;
+  out ABlockSize: Int64; out AError: string): Pointer;
 procedure FreeEnvironmentBlockUTF16(ABlock: Pointer);
+procedure UpdatePerDriveEntries(ASession: TSession; const AEnv: TEnvironmentMap);
 
 implementation
 
-function CompareKeys(constref Left, Right: string): Integer;
-begin
-  Result := CompareText(Left, Right);
-end;
-
-procedure LoadCurrentEnvironment(var ASession: TSession);
+procedure LoadCurrentEnvironment(ASession: TSession);
 var
-  I: Integer;
-  EnvStr, Name, Value: string;
-  PosEq: Integer;
+  EnvBlock, P, LineStart: PWideChar;
+  Entry, Name, Value: string;
+  SepPos: Integer;
+  Drive: Char;
 begin
-  if not Assigned(ASession.Environment) then
-    ASession.Environment := TEnvironmentMap.Create;
-
   ASession.Environment.Clear;
+  ASession.PerDriveCwd.Clear;
 
-  for I := 1 to GetEnvironmentVariableCount do
-  begin
-    EnvStr := GetEnvironmentString(I);
-    PosEq := Pos('=', EnvStr);
-    if PosEq > 1 then
+  EnvBlock := GetEnvironmentStringsW;
+  if EnvBlock = nil then Exit;
+  try
+    P := EnvBlock;
+    while P^ <> #0 do
     begin
-      Name := Copy(EnvStr, 1, PosEq - 1);
-      Value := Copy(EnvStr, PosEq + 1, Length(EnvStr));
-      ASession.Environment.AddOrSetValue(Name, Value);
+      LineStart := P;
+      while P^ <> #0 do Inc(P);
+      Entry := LineStart;
+      if Entry <> '' then
+      begin
+        if Entry[1] = '=' then
+          SepPos := Pos('=', Entry, 2)
+        else
+          SepPos := Pos('=', Entry);
+        if SepPos > 1 then
+        begin
+          Name := Copy(Entry, 1, SepPos - 1);
+          Value := Copy(Entry, SepPos + 1, Length(Entry));
+          ASession.Environment.AddOrSetValue(Name, Value);
+          if (Length(Name) >= 3) and (Name[1] = '=') and (Name[3] = ':') then
+          begin
+            Drive := UpCase(Name[2]);
+            ASession.PerDriveCwd.AddOrSetValue(Drive, Value);
+          end;
+        end;
+      end;
+      Inc(P);
     end;
+  finally
+    FreeEnvironmentStringsW(EnvBlock);
   end;
+  ASession.Cwd := GetCurrentDir;
 end;
 
-function BuildEnvironmentBlockUTF16(const AEnvMap: TEnvironmentMap; out ABlockSize: Int64): Pointer;
+function BuildEnvironmentBlockUTF16(const AEnv: TEnvironmentMap;
+  out ABlockSize: Int64; out AError: string): Pointer;
 var
-  Keys: TList<string>;
+  Keys: TStringList;
   I, J: Integer;
   Key, Val, Pair: string;
-  CharCount, TotalChars: Int64;
-  PBuffer: PChar;
-  PWrite: PChar;
-  Comparer: IComparer<string>;
+  TotalChars: Int64;
+  PBuffer, Cursor: PWideChar;
 begin
-  Keys := TList<string>.Create;
-  try
-    for Key in AEnvMap.Keys do
-      Keys.Add(Key);
+  Result := nil;
+  ABlockSize := 0;
+  AError := '';
 
-    Comparer := TComparer<string>.Construct(CompareKeys);
-    Keys.Sort(Comparer);
+  Keys := TStringList.Create;
+  try
+    for Key in AEnv.Keys do Keys.Add(Key);
+    Keys.CaseSensitive := False;
+    Keys.Sort;
 
     TotalChars := 0;
     for I := 0 to Keys.Count - 1 do
     begin
       Key := Keys[I];
-      if AEnvMap.TryGetValue(Key, Val) then
+      if not AEnv.TryGetValue(Key, Val) then Continue;
+      if Length(Val) > CMDX2_ENV_VAR_LIMIT_CHARS - Length(Key) - 1 then
       begin
-        Pair := Key + '=' + Val;
-        TotalChars := TotalChars + Length(Pair) + 1; // +1 for null separator
+        AError := Format('Variable "%s" value is %d chars; exceeds %d',
+          [Key, Length(Val), CMDX2_ENV_VAR_LIMIT_CHARS]);
+        Exit;
       end;
+      TotalChars := TotalChars + Length(Key) + 1 + Length(Val) + 1;
     end;
-    TotalChars := TotalChars + 1; // Extra final null character
+    TotalChars := TotalChars + 1;
 
-    ABlockSize := TotalChars * SizeOf(Char);
+    ABlockSize := TotalChars * SizeOf(WideChar);
     GetMem(PBuffer, ABlockSize);
-    PWrite := PBuffer;
-
-    for I := 0 to Keys.Count - 1 do
-    begin
-      Key := Keys[I];
-      if AEnvMap.TryGetValue(Key, Val) then
+    try
+      Cursor := PBuffer;
+      for I := 0 to Keys.Count - 1 do
       begin
+        Key := Keys[I];
+        if not AEnv.TryGetValue(Key, Val) then Continue;
         Pair := Key + '=' + Val;
-        CharCount := Length(Pair);
-        for J := 1 to CharCount do
+        for J := 1 to Length(Pair) do
         begin
-          PWrite^ := Pair[J];
-          Inc(PWrite);
+          Cursor^ := Pair[J];
+          Inc(Cursor);
         end;
-        PWrite^ := #0;
-        Inc(PWrite);
+        Cursor^ := #0;
+        Inc(Cursor);
       end;
+      Cursor^ := #0;
+      Result := PBuffer;
+    except
+      FreeMem(PBuffer);
+      raise;
     end;
-    PWrite^ := #0;
-
-    Result := PBuffer;
   finally
     Keys.Free;
   end;
@@ -104,8 +124,32 @@ end;
 
 procedure FreeEnvironmentBlockUTF16(ABlock: Pointer);
 begin
-  if Assigned(ABlock) then
-    FreeMem(ABlock);
+  if Assigned(ABlock) then FreeMem(ABlock);
+end;
+
+procedure UpdatePerDriveEntries(ASession: TSession; const AEnv: TEnvironmentMap);
+var
+  Drive: Char;
+  Key, Value: string;
+  ToRemove: TList<string>;
+begin
+  ToRemove := TList<string>.Create;
+  try
+    for Key in AEnv.Keys do
+      if (Length(Key) >= 3) and (Key[1] = '=') and (Key[3] = ':') then
+        if not ASession.PerDriveCwd.ContainsKey(UpCase(Key[2])) then
+          ToRemove.Add(Key);
+    for Key in ToRemove do AEnv.Remove(Key);
+
+    for Drive in ASession.PerDriveCwd.Keys do
+    begin
+      Key := '=' + Drive + ':';
+      Value := ASession.PerDriveCwd[Drive];
+      AEnv.AddOrSetValue(Key, Value);
+    end;
+  finally
+    ToRemove.Free;
+  end;
 end;
 
 end.

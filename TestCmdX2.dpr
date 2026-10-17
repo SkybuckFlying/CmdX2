@@ -1,138 +1,124 @@
-program TestCmdX2;
+﻿program TestCmdX2;
 
 {$APPTYPE CONSOLE}
-
-{$IFDEF FPC}
-  {$MODE DELPHI}
-{$ENDIF}
+{$IFDEF FPC}{$MODE DELPHI}{$ENDIF}
 
 uses
-  SysUtils,
-  Classes,
-  CmdX2Types,
-  CmdX2Config,
-  CmdX2Path,
-  CmdX2Resolver,
-  CmdX2Env,
-  CmdX2Probe,
-  CmdX2Parser,
-  CmdX2Exec,
-  CmdX2Batch,
-  CmdX2Diagnostics,
-  CmdX2Builtins;
+  SysUtils, Classes, Generics.Collections, Windows,
+  CmdX2Types, CmdX2Exec, CmdX2Parser, CmdX2Path;
 
 var
-  Session: TSession;
-  PassedCount, FailedCount: Integer;
+  Passed, Failed: Integer;
 
-procedure AssertTrue(const AMessage: Boolean; const ATestName: string);
+procedure Check(const ATestName: string; ACondition: Boolean);
 begin
-  if AMessage then
+  if ACondition then
   begin
     Writeln('[PASS] ', ATestName);
-    Inc(PassedCount);
+    Inc(Passed);
   end
   else
   begin
     Writeln('[FAIL] ', ATestName);
-    Inc(FailedCount);
+    Inc(Failed);
   end;
 end;
 
-procedure TestVariableExpansion;
+procedure TestComparer;
 var
-  Res: string;
+  Env: TEnvironmentMap;
 begin
-  Session.Environment.AddOrSetValue('MY_VAR', 'HelloWorld');
-  Res := ExpandVariables('Echo %MY_VAR%!', Session);
-  AssertTrue(Res = 'Echo HelloWorld!', 'Variable expansion %MY_VAR%');
-end;
-
-procedure TestResolverAndBuiltins;
-begin
-  AssertTrue(IsBuiltInCommand('dir'), 'Builtin check: dir');
-  AssertTrue(IsBuiltInCommand('cmdx2'), 'Builtin check: cmdx2');
-  AssertTrue(not IsBuiltInCommand('custom_unknown_tool'), 'Non-builtin check');
-end;
-
-procedure TestPathStressTest;
-var
-  I: Integer;
-  EntrySource: TPathEntrySource;
-  CharCount, EntryCount: Integer;
-  ByteSize: Int64;
-  ResolvedPath, MatchedExt: string;
-  PathIdx: Integer;
-  TargetDir, TargetExe: string;
-begin
-  Session.PathEntries.Clear;
-  TargetDir := ExtractFilePath(ParamStr(0));
-  TargetExe := ExtractFileName(ParamStr(0));
-
-  for I := 1 to 10000 do
-  begin
-    EntrySource.Path := 'C:\LongToolsDirectoryPath\SubToolDirectoryFolder_' + IntToStr(I) + '\BinDirectory_' + IntToStr(I);
-    EntrySource.SourceFile := 'StressTest';
-    EntrySource.Priority := 1;
-    Session.PathEntries.Add(EntrySource);
-
-    if I = 5000 then
-    begin
-      EntrySource.Path := TargetDir;
-      EntrySource.SourceFile := 'StressTestTarget';
-      EntrySource.Priority := 1;
-      Session.PathEntries.Add(EntrySource);
-    end;
-  end;
-
-  RebuildInMemoryPath(Session);
-  GetPathLengthStats(Session, CharCount, EntryCount, ByteSize);
-
-  AssertTrue(EntryCount >= 10000, 'PATH stress test entry count >= 10,000');
-  AssertTrue(ByteSize >= 500000, 'PATH stress test size >= 500 KB');
-
-  AssertTrue(ResolveCommand(Session, TargetExe, ResolvedPath, MatchedExt, PathIdx),
-             'Command resolution in 10,000 entry long PATH');
-end;
-
-procedure TestEnvironmentBlock;
-var
-  BlockPtr: Pointer;
-  BlockSize: Int64;
-begin
-  BlockPtr := BuildEnvironmentBlockUTF16(Session.Environment, BlockSize);
+  Env := NewEnvironmentMap;
   try
-    AssertTrue(Assigned(BlockPtr), 'Environment block pointer allocated');
-    AssertTrue(BlockSize > 0, 'Environment block size > 0');
+    Env.AddOrSetValue('PATH', 'a');
+    Env.AddOrSetValue('Path', 'b');
+    Env.AddOrSetValue('path', 'c');
+    Check('Case-insensitive env map (3 entries collapse to 1)', Env.Count = 1);
+    Check('Last write wins', Env['PATH'] = 'c');
   finally
-    FreeEnvironmentBlockUTF16(BlockPtr);
+    Env.Free;
+  end;
+end;
+
+procedure TestTokenizer;
+var
+  Toks: TTokenList;
+begin
+  Toks := Tokenize('echo hello');
+  try
+    Check('echo hello → 2 words', (Toks.Count = 2)
+      and (Toks[0].Kind = tkWord) and (Toks[0].Text = 'echo'));
+  finally
+    Toks.Free;
+  end;
+
+  Toks := Tokenize('echo a 2>&1');
+  try
+    Check('2>&1 tokenized',
+      (Toks.Count = 4) and (Toks[3].Kind = tkRedirectDupErr));
+  finally
+    Toks.Free;
+  end;
+
+  Toks := Tokenize('echo a 1>&2');
+  try
+    Check('1>&2 tokenized',
+      (Toks.Count = 4) and (Toks[3].Kind = tkRedirectDupOut));
+  finally
+    Toks.Free;
+  end;
+
+  Toks := Tokenize('a&&b');
+  try
+    Check('a&&b gives 3 tokens',
+      (Toks.Count = 3)
+      and (Toks[1].Kind = tkAnd)
+      and (Toks[0].Text = 'a') and (Toks[2].Text = 'b'));
+  finally
+    Toks.Free;
+  end;
+
+  Toks := Tokenize('a^&b');
+  try
+    Check('a^&b is one word a&b',
+      (Toks.Count = 1) and (Toks[0].Text = 'a&b'));
+  finally
+    Toks.Free;
+  end;
+end;
+
+procedure TestQuoteArg;
+begin
+  Check('QuoteArg empty → ""', WinQuoteArg('') = '""');
+  Check('QuoteArg simple', WinQuoteArg('abc') = 'abc');
+  Check('QuoteArg with space', WinQuoteArg('a b') = '"a b"');
+  Check('QuoteArg trailing slash', WinQuoteArg('a b\') = '"a b\\"');
+end;
+
+procedure TestRebuildPath;
+var
+  S: TSession;
+begin
+  S := TSession.Create;
+  try
+    S.Environment.AddOrSetValue('PATH', 'C:\A;C:\B;C:\C');
+    RebuildPathEntries(S);
+    Check('RebuildPathEntries gives 3 entries', S.PathEntries.Count = 3);
+    Check('RawPath set', S.RawPath = 'C:\A;C:\B;C:\C');
+  finally
+    S.Free;
   end;
 end;
 
 begin
-  PassedCount := 0;
-  FailedCount := 0;
-
-  InitSession(Session);
-  try
-    LoadCurrentEnvironment(Session);
-    PerformCeilingProbe(Session, False);
-
-    Writeln('=== Running CmdX2 Test Suite ===');
-    TestVariableExpansion;
-    TestResolverAndBuiltins;
-    TestEnvironmentBlock;
-    TestPathStressTest;
-
-    Writeln;
-    Writeln(Format('Test Summary: %d Passed, %d Failed.', [PassedCount, FailedCount]));
-
-    if FailedCount > 0 then
-      Halt(1)
-    else
-      Halt(0);
-
-  finally
-    FreeSession(Session);
-  end;
+  Passed := 0;
+  Failed := 0;
+  Writeln('=== CmdX2 Milestone A Tests ===');
+  TestComparer;
+  TestTokenizer;
+  TestQuoteArg;
+  TestRebuildPath;
+  Writeln;
+  Writeln(Format('Summary: %d passed, %d failed', [Passed, Failed]));
+  if Failed > 0 then Halt(1) else Halt(0);
 end.

@@ -1,0 +1,911 @@
+# CmdX2 — Plan v3 (Definitive Specification)
+
+**Status:** Final. Supersedes v1, v2, and all prior amendments. Incorporates ChatGPT-6's four amendments from its v2 review plus the guard on `CMDX2_SESSION`, the pipeline decision resolved as "build native, do not delegate," and a complete specification for every subsystem. No phase defers work that the milestone depends on.
+
+---
+
+## 0. Vision and Committed Principles
+
+### 0.1 What CmdX2 is
+
+A native Delphi 13 Win64 command interpreter that:
+
+1. **Stores and reads PATH in the Windows registry** as the single source of truth, bypassing the 4095-character GUI editor limit.
+2. **Passes a full, untruncated Unicode environment block to every child** via `CreateProcessW`, bypassing `cmd.exe`'s 8191-character inheritance discard rule.
+3. **Executes native pipelines, redirection, and operators** without delegating to `cmd.exe`.
+4. **Interprets batch files** with control flow (`goto`, `call`, `if`, `for`, `setlocal`) sufficient to run real-world `.bat` and `.cmd` files from installers, build systems, and toolchains.
+5. **Manages persistent PATH** via `cmdx2 path add/remove/check/backup/restore` that writes to the registry with verification and broadcasts `WM_SETTINGCHANGE`.
+6. **Can serve as `COMSPEC`** for applications that honor it, with documented limitations for those that hardcode `cmd.exe`.
+
+### 0.2 Committed principles
+
+| Principle | Consequence |
+| :--- | :--- |
+| **Registry is authoritative at outermost launch** | No TOML. No private database. No merge sources beyond machine + user. |
+| **Never silently truncate PATH** | Every failure to fit is reported with sizes and options. |
+| **Never delegate to `System32\cmd.exe`** | Native pipes, redirection, and operators, always. |
+| **Preserve the child's environment faithfully** | `=X:` drive-cwd entries, `REG_EXPAND_SZ` types, and Unicode survive round-trip. |
+| **Case-insensitive environment** | `PATH`, `Path`, `path` are one variable. |
+| **Deterministic nested-session behavior** | `CMDX2_SESSION` marker plus non-empty-inherited-PATH guard. |
+| **No probe, no shims, no trimming strategies** | Fixed ceiling at 32,767 chars per variable. Full block or documented failure. |
+| **No system file modification** | No IFEO. No replacing `System32\cmd.exe`. COMSPEC is env-var only. |
+| **Honest scope claims** | CmdX2 is a capable interpreter, not a byte-for-byte `cmd.exe` clone. Divergences are documented. |
+
+### 0.3 Non-goals (final, not to be reopened)
+
+- Byte-for-byte fidelity with undocumented `cmd.exe` quirks.
+- Replacing `System32\cmd.exe` on disk.
+- Intercepting applications that hardcode `cmd.exe` by full path.
+- PATH storage longer than 32,767 characters per variable.
+- The probe / 64 MB environment testing from the original spec.
+- The TOML configuration hierarchy.
+- Shims, launchers, and multi-source PATH strategies.
+
+---
+
+## 1. Frozen Architecture
+
+### 1.1 Component map
+
+| Component | Unit | Responsibility |
+| :--- | :--- | :--- |
+| **Types & session** | `CmdX2Types.pas` | Data structures, session lifecycle |
+| **Registry** | `CmdX2Registry.pas` | Read/write/backup/restore PATH; `REG_EXPAND_SZ` handling; `WM_SETTINGCHANGE` |
+| **Environment** | `CmdX2Env.pas` | Inherited environment load (including `=X:`); block construction (UTF-16LE) |
+| **Parser** | `CmdX2Parser.pas` | Tokenization, expansion, operator/redirect/pipe structure |
+| **Resolver** | `CmdX2Resolver.pas` | Command-name to absolute path (PATHEXT, current-dir rule, PATH ordering) |
+| **Builtins** | `CmdX2Builtins.pas` | All `cmd.exe` builtins plus `cmdx2` subcommands |
+| **Executor** | `CmdX2Exec.pas` | Process launch, pipeline engine, redirection, operator sequencing |
+| **Batch** | `CmdX2Batch.pas` | Script execution, labels, `goto`, `call`, `if`, `for`, argument substitution |
+| **Diagnostics** | `CmdX2Diagnostics.pas` | `cmdx2 path/which/diagnose/env-dump`, log writer |
+| **Shell main** | `cmdx2.dpr` | REPL, `/c` `/k`, startup PATH selection |
+| **Path test** | `cmdx2_pathtest.dpr` | Native child used by acceptance tests |
+| **Tests** | `TestCmdX2.dpr` | Unit and integration test suite |
+
+### 1.2 Data structures
+
+```pascal
+type
+  TEnvKeyComparer = class(TInterfacedObject, IEqualityComparer<string>)
+    function Equals(const L, R: string): Boolean;
+    function GetHashCode(const V: string): Integer;
+  end;
+
+  TEnvironmentMap = TDictionary<string, string>;
+
+  TPathEntry = record
+    Path: string;
+    Source: (psMachine, psUser, psSession);
+  end;
+
+  TRedirectTarget = record
+    Handle: (rhNone, rhStdout, rhStderr);
+    Mode: (rmOverwrite, rmAppend);
+    Target: string;
+  end;
+
+  TParsedCommand = record
+    ProgramName: string;
+    Args: TStringList;
+    Redirects: TList<TRedirectTarget>;
+    PipeToNext: Boolean;
+    Op: (opNone, opAnd, opOr, opSeq);
+  end;
+
+  TParsedCommandLine = TList<TParsedCommand>;
+
+  TBatchFrame = record
+    FilePath: string;
+    Lines: TStringList;
+    CurrentLine: Integer;
+    Labels: TDictionary<string, Integer>; // lowercased name → line index
+    Arg0: string;                          // %0
+    Args: TStringList;                     // %1..%9
+    EchoState: Boolean;
+  end;
+
+  TSession = record
+    Environment: TEnvironmentMap;
+    RawPath: string;
+    PathEntries: TList<TPathEntry>;
+    PathExtList: TStringList;
+    Cwd: string;
+    Drive: Char;
+    ErrorLevel: Integer;
+    ShouldExit: Boolean;
+    SetLocalStack: TList<TEnvironmentMap>;
+    DelayedExpansion: Boolean;
+    DelayedStack: TList<Boolean>;
+    BatchStack: TList<TBatchFrame>;
+    DirectoryStack: TStringList;
+    ResolverCache: TDictionary<string, string>;
+    UsedEntries: TDictionary<string, Boolean>;   // reserved, used by env-dump diagnostics only
+  end;
+
+const
+  CMDX2_ENV_VAR_LIMIT_CHARS = 32767;
+  CMDX2_CMD_INHERIT_LIMIT_CHARS = 8191;  // for compatibility warnings only
+```
+
+### 1.3 Threading model
+
+Single-threaded event loop. The console reader runs on the main thread. The executor blocks on child processes (`WaitForSingleObject`) except for pipeline stages, which are started concurrently but waited in sequence. No background threads in v1.
+
+Rationale: simplicity. A console shell does not benefit from concurrency beyond pipelines, and the mental model of "one command at a time" is what users expect. If a background task is needed later, it goes in Phase 5+.
+
+---
+
+## 2. Phase 0 — Parser Rewrite (1 week)
+
+The parser is the foundation. It is rewritten, not patched, to a complete specification.
+
+### 2.1 Tokenizer grammar
+
+The tokenizer processes an expanded command line (`ExpandVariables` is applied first, see §3) into a token list. Tokens:
+
+| Token type | Examples |
+| :--- | :--- |
+| `tkWord` | `echo`, `"quoted string"`, `file.txt` |
+| `tkRedirectOut` | `>`, `>>` |
+| `tkRedirectIn` | `<` |
+| `tkRedirectErr` | `2>`, `2>>` |
+| `tkPipe` | `\|` |
+| `tkAnd` | `&&` |
+| `tkOr` | `\|\|` |
+| `tkSeq` | `&` |
+
+Tokenizer rules:
+
+1. Iterate `Ch in Expanded`. State variable `InQuote: Boolean`.
+2. If `Ch = '"'`: toggle `InQuote`; append `Ch` to `CurrToken`. (Quotes are preserved for argument reconstruction; stripping happens in argument processing.)
+3. If `InQuote`: append `Ch` to `CurrToken`.
+4. If `Ch in [' ', #9]` (not in quote): flush `CurrToken` as `tkWord` if non-empty.
+5. If `Ch = '2'` and next char is `'>'`: emit `2>` (or `2>>` if next two are `>>`); skip 1 or 2 chars. **Must be checked before `>` branch.**
+6. If `Ch = '>'`: emit `>` or `>>` (if next is `>`); skip.
+7. If `Ch = '<'`: emit `<`.
+8. If `Ch = '\|'`: emit `\|` or `\|\|` (if next is `\|`); skip.
+9. If `Ch = '&'`: emit `&` or `&&`; skip.
+10. Otherwise: append `Ch` to `CurrToken`.
+11. **Critical:** every branch is exclusive. Use `if / else if / else`. No fall-through. After the chain, `Inc(I)`. The final `else` is what appends ordinary characters.
+12. End of input: flush `CurrToken`.
+
+### 2.2 Parser grammar
+
+Parser converts the token list to `TParsedCommandLine`:
+
+- Accumulate `tkWord` into `Cmd.ProgramName` and `Cmd.Args`.
+- On `tkRedirectOut` / `tkRedirectOut`+append: consume next `tkWord`; add `TRedirectTarget` with `rhStdout`, mode; continue.
+- On `tkRedirectErr`: same with `rhStderr`.
+- On `tkRedirectIn`: consume next `tkWord`; store in `Cmd.RedirInput`.
+- On `tkPipe`: flush current `Cmd` with `PipeToNext := True`; start new `Cmd`.
+- On `tkAnd`, `tkOr`, `tkSeq`: set `Cmd.Op`; flush; start new.
+- Multiple redirections on one command (`>out 2>err`) are allowed and honored.
+- Malformed input (redirect with no target): report and skip the command.
+
+### 2.3 Expansion engine (`ExpandVariables`)
+
+Rewrite completely. Behavior in two passes:
+
+**Pass 1 — percent expansion** (`%VAR%`, `%0`–`%9`, `%*`, `%~dp0`, `%~nx0`):
+
+- Iterate. On `%`:
+  - `%%` at command level → literal `%`.
+  - `%%X` in a batch `for` context → `%X` (for-variable).
+  - `%0`–`%9` → batch argument substitution (see §7.3).
+  - `%~dp0`, `%~f0`, `%~nx0`, `%~dp1`, etc. → argument modifiers (see §7.3).
+  - `%NAME%` → environment lookup; if absent, leave `%NAME%` literal (matches `cmd.exe`).
+  - Trailing `%` → literal `%`.
+
+**Pass 2 — caret escaping** (`^`):
+
+- On `^` (not in quote): skip it, append the next character literally, advance two. Never fall through to `%`/`!`.
+- On `^` at end-of-line: append `^`.
+- In `cmd /c` context, `^` also escapes operators at the shell boundary—handled before parse (see §6.5).
+
+**Pass 3 — delayed expansion** (`!VAR!`):
+
+- Only when `ASession.DelayedExpansion = True` (set by `setlocal enabledelayedexpansion`).
+- On `!`: lookup `VAR` case-insensitively; append value. If absent, append literal `!VAR!`.
+- Trailing `!`: literal.
+
+Order matters: `%` expansion, then `^` escaping, then `!` expansion. This matches `cmd.exe`'s documented order.
+
+### 2.4 Current-directory and `NoDefaultCurrentDirectoryInExePath`
+
+The resolver checks the current directory before PATH unless `NoDefaultCurrentDirectoryInExePath` is present in the environment (any value). This is a per-process setting; CmdX2 reads it at each resolution.
+
+### 2.5 Acceptance for Phase 0
+
+`TestCmdX2.dpr` unit tests pass for: ordinary words, quoted strings, all operator tokens, `2>` and `2>>`, `&&` / `||` sequencing, caret escapes, percent expansion (defined, undefined, `%%`), delayed expansion (on and off), batch argument substitution.
+
+Interactive test: `echo hello world`, `echo "hello world"`, `echo a^b`, `echo a&&echo b`, `echo a||echo b`, `echo hi > out.txt`, `echo err 2>err.txt`, `dir 2>&1`.
+
+---
+
+## 3. Phase 1 — Environment & Shell Correctness (1 week)
+
+### 3.1 Environment map case-insensitivity
+
+`TEnvKeyComparer` (see §1.2) with `CompareText` for equals and `LowerCase`-based hash. Applied to `TEnvironmentMap`, `SetLocalStack` snapshots, and `ResolverCache` keys (which use lowercased names).
+
+Regression test: insert `PATH`, `Path`, `path`; assert one entry; assert last write wins.
+
+### 3.2 `LoadCurrentEnvironment` rewrite
+
+Reads `GetEnvironmentStringsW`, splits each entry:
+
+```
+if Entry[1] = '=' then
+  // =X:=VALUE form
+  SepPos := Pos('=', Entry, 2)
+  Name := Copy(Entry, 1, SepPos - 1)      // '=C:'
+  Value := Copy(Entry, SepPos + 1, ...)   // 'C:\Projects'
+else
+  SepPos := Pos('=', Entry)
+  Name := Copy(Entry, 1, SepPos - 1)
+  Value := Copy(Entry, SepPos + 1, ...)
+```
+
+Skip empty names. Add to map. Preserve `=X:` entries through `BuildEnvironmentBlockUTF16` unchanged (they are valid entries in the child block).
+
+Regression test: launch CmdX2 from a shell that has `=C:=C:\Projects`; verify child block contains `=C:=C:\Projects`.
+
+### 3.3 `BuildEnvironmentBlockUTF16` revision
+
+- Sort keys case-insensitively (`CompareText`).
+- For each pair, append `NAME=VALUE` + `#0`.
+- Append final `#0`.
+- Total chars: sum of `(Length(NAME) + 1 + Length(VALUE) + 1)` + 1.
+- Byte size: `TotalChars * SizeOf(Char)`.
+- Sanity check: each variable's value length ≤ `CMDX2_ENV_VAR_LIMIT_CHARS`. If exceeded, report and refuse to launch (do not truncate).
+
+### 3.4 `set NAME=VALUE`
+
+Parse `AArgs`. If `AArgs[0]` contains `=`:
+
+- Split at first `=`.
+- If name is `PATH` (case-insensitive): update `Environment['PATH']`, call `RebuildInMemoryPath`, clear resolver cache.
+- Else: `Environment[name] := value` (empty value means delete, matching `cmd.exe`'s `set NAME=` behavior).
+
+If `AArgs[0]` does not contain `=` and is non-empty: list all variables whose names start with `AArgs[0]` (case-insensitive prefix).
+
+If no arguments: list all variables sorted.
+
+### 3.5 `path` builtin
+
+- No args: print `PATH=...`.
+- With args: join all args with `;` if not already present, set `PATH`, rebuild, clear cache.
+- `path ;` or `path` with empty argument: clear PATH in session (does not touch registry).
+
+### 3.6 Builtin execution termination
+
+`ExecuteParsedCommandLine`: for each command in list, if `IsBuiltInCommand`, run builtin, set `Result := ExecRes`, handle `Op` (break on `opAnd` if nonzero, `opOr` if zero), continue to next command. Never attempt external resolution for a builtin name.
+
+### 3.7 `CreateProcessW` failure detection
+
+On `Res = False`:
+
+- `Err := GetLastError`.
+- Map `Err` to a message: `ERROR_FILE_NOT_FOUND` (2) → "The system cannot find the file specified."; `ERROR_ACCESS_DENIED` (5) → "Access is denied."; `ERROR_ENVVAR_NOT_FOUND` (203) → "The system could not find the environment option that was entered."; `ERROR_INVALID_PARAMETER` (87) → "The parameter is incorrect."; fallback → `SysErrorMessage(Err)`.
+- Set `ASession.ErrorLevel := 9001`, return 9001.
+- Print: `Error launching "<program>": <message> (error <n>)`.
+
+### 3.8 `lpApplicationName` and command-line construction
+
+`CreateProcessW(AExePath, CmdLineStr, ...)` with `AExePath` as `lpApplicationName` (never `nil`). `CmdLineStr`:
+
+```
+'"' + AExePath + '"'
+for each arg in AArgs:
+  CmdLineStr += ' ' + QuoteArg(arg)
+```
+
+`QuoteArg` follows the Windows `CommandLineToArgvW` inverse rules:
+
+- If arg is empty → `""`.
+- If arg contains no space/tab/quote and is non-empty → arg unchanged.
+- Else → wrap in `"`, doubling any internal `"`, and doubling backslashes that precede a `"`.
+
+Implement a helper `WinQuoteArg(const S: string): string` in `CmdX2Exec.pas` and unit-test it against `CommandLineToArgvW` round-trip.
+
+### 3.9 `cls` — console handle
+
+Enable `ENABLE_VIRTUAL_TERMINAL_PROCESSING` at startup on `STD_OUTPUT_HANDLE` via `SetConsoleMode`. If it fails (redirected output), fall back to `FillConsoleOutputCharacterW` + `SetConsoleCursorPosition`. Either path clears correctly.
+
+### 3.10 Per-session `DirectoryStack`
+
+Move `pushd`/`popd` stack into `TSession`.
+
+### 3.11 Resolver cache invalidation
+
+`RebuildInMemoryPath` calls `ASession.ResolverCache.Clear`.
+
+### 3.12 `exit N`
+
+Parse `AArgs[0]` as integer if present; set `ErrorLevel` and `ShouldExit`. `exit /b` inside a batch returns to caller (see §7.5).
+
+### 3.13 Current-directory search
+
+Before PATH loop, if `NoDefaultCurrentDirectoryInExePath` is absent, try `CombinePath(Cwd, Name)` + PATHEXT. First match wins.
+
+### 3.14 Phase 1 acceptance
+
+`TestCmdX2.dpr` extended with: case-insensitive `set`, `set FOO=bar` + `echo %FOO%`, `=C:` preservation, caret escapes, `&&`/`||` sequencing, `2>` capture, cache invalidation, `CreateProcessW` failure errorlevel, `QuoteArg` round-trip.
+
+Interactive test: `set`, `path`, `echo`, `cd`, `dir`, `type`, `del`, `md`, `rd`, `cls`, `exit N`, `setlocal`/`endlocal`, `pushd`/`popd`.
+
+---
+
+## 4. Phase 2 — Registry PATH & Long-PATH Execution (2 weeks)
+
+**The phase that solves the original problem.**
+
+### 4.1 `CmdX2Registry.pas` — complete API
+
+```pascal
+type
+  TRegistryPath = record
+    RawValue: string;      // unexpanded
+    ValueType: string;     // 'REG_SZ' or 'REG_EXPAND_SZ'
+    Expanded: string;      // expanded for use
+    Length: Integer;       // length of RawValue in chars
+  end;
+
+function ReadPath(AHive: HKEY; const ASubKey: string;
+  out APath: TRegistryPath): Boolean;
+// RegOpenKeyExW → RegQueryValueExW → inspect type → return raw + type.
+// Does not expand.
+
+function ExpandPath(const ARaw: string): string;
+// ExpandEnvironmentStringsW. Documented as expanding in the calling
+// process's environment context. This is acceptable for interactive use;
+// service-account launch caveat documented in DIVERGENCES.md.
+
+function GetMergedRegistryPath(out AMachine, AUser: TRegistryPath;
+  out AMergedExpanded: string): Boolean;
+// Reads both, expands, merges (machine first, user second), deduplicates
+// case-insensitively preserving first occurrence.
+
+procedure BroadcastEnvironmentChange;
+// SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0,
+//   LParam('Environment'), SMTO_ABORTIFHUNG, 5000, ...).
+
+function WriteUserPath(const ANewRaw, AValueType: string;
+  out AError: string): Boolean;
+// Full sequence with backup, write, verify, rollback on mismatch, broadcast.
+
+function BackupUserPath(const ABackupDir: string; out ABackupFile: string): Boolean;
+// Writes two files: <timestamp>.reg (reg.exe export of HKCU\Environment)
+// and <timestamp>.json (raw value, type, timestamp, machine+user lengths).
+
+function RestoreUserPath(const ABackupFile: string; out AError: string): Boolean;
+// Reads JSON sidecar, writes raw value with original type, verifies, broadcasts.
+```
+
+### 4.2 Registry write sequence (`cmdx2 path add/remove`)
+
+Every write follows this exact sequence:
+
+```
+1. Read current User PATH (RawValue, ValueType)
+2. Parse RawValue on ';' into TStringList
+3. Modify (add: append if not duplicate; remove: filter out case-insensitive,
+   trailing-slash-insensitive match)
+4. Join with ';'
+5. Validate:
+   - Length of new value in chars
+   - If > CMDX2_ENV_VAR_LIMIT_CHARS: refuse with error, no write
+   - If > CMDX2_CMD_INHERIT_LIMIT_CHARS: warn (cmd.exe compatibility)
+   - Duplicate check: refuse if would introduce duplicates
+6. Backup current value to memory buffer
+7. RegSetValueExW with original ValueType, cbData = (Length(NewValue)+1)*SizeOf(Char)
+8. RegQueryValueExW again; string-compare with written value
+9. If mismatch: RegSetValueExW with backup buffer; report rollback; no broadcast
+10. BroadcastEnvironmentChange
+11. Update ASession.Environment['PATH'] and RebuildInMemoryPath
+12. Return new length and success
+```
+
+The verification step (8) is mandatory. Never broadcast on unverified write.
+
+### 4.3 Startup PATH selection (`cmdx2.dpr`)
+
+```
+1. InitSession
+2. LoadCurrentEnvironment  (preserves =X: entries)
+3. GetMergedRegistryPath → AMerged
+4. if Environment contains 'CMDX2_SESSION' then
+     if Environment['PATH'] is non-empty and length > 0 then
+       // nested session with valid inherited PATH
+       ASession.Environment['PATH'] := Environment['PATH']
+     else
+       // nested session but PATH was discarded by intervening cmd.exe
+       ASession.Environment['PATH'] := AMerged
+   else
+     ASession.Environment['PATH'] := AMerged
+5. RebuildInMemoryPath
+6. ASession.Environment['CMDX2_SESSION'] := '1'
+```
+
+This is the `CMDX2_SESSION` rule with the non-empty guard ChatGPT-6 and I agreed on.
+
+### 4.4 `/c` and `/k` (`cmdx2.dpr`, `ProcessArgs`)
+
+Match `cmd.exe`:
+
+- `cmdx2 /c <args…>`: join remaining args with spaces; parse and execute once; exit with errorlevel.
+- `cmdx2 /c`: exit immediately with errorlevel 0 (matches `cmd /c` with no command, though behavior is version-dependent; documented in DIVERGENCES.md).
+- `cmdx2 /k <args…>`: join remaining args; execute once; then enter interactive REPL.
+- `cmdx2 /k`: enter interactive REPL.
+- `cmdx2 /d`, `/q`, `/s`, `/e:on|off`, `/v:on|off`, `/f:on|off`, `/a`, `/u`: recognized and either honored or ignored; document each.
+- `cmdx2 <file.bat> [args]`: execute batch; exit with errorlevel.
+
+### 4.5 Native pipes — full implementation
+
+Pipes are not deferred. The pipeline engine runs in Phase 2.
+
+**Algorithm for `cmd1 | cmd2 | … | cmdN`:**
+
+```
+handles: array of THandle pairs (read, write)
+for i in 1..N-1:
+  CreatePipe(sec[InheritHandle=True], handles[i].read, handles[i].write)
+  SetHandleInformation(handles[i].read, HANDLE_FLAG_INHERIT, 0)  // parent side
+  SetHandleInformation(handles[i].write, HANDLE_FLAG_INHERIT, 0)
+
+processes: array of TProcessInformation
+for i in 1..N:
+  SI.i := (i = 1) ? GetStdHandle(STD_INPUT_HANDLE)  : handles[i-1].read
+  SI.o := (i = N) ? GetStdHandle(STD_OUTPUT_HANDLE) : handles[i].write
+  SI.e := GetStdHandle(STD_ERROR_HANDLE)
+  Set SI.dwFlags := STARTF_USESTDHANDLES
+  CreateProcessW with bInheritHandles=True
+
+close all pipe handles in parent after all launches
+WaitForMultipleObjects on all processes
+for i in 1..N: GetExitCodeProcess(PI[i].hProcess)
+Result := exit code of last process
+ErrorLevel := Result
+```
+
+**Important:** the pipeline engine runs each stage's program through the **same** `ExecuteParsedCommandLine` resolution path but with a modified launch step. Builtins inside a pipeline (e.g., `echo hi | findstr h`) require special handling—`echo` is a builtin, but a pipeline stage must be a real process. For v1, builtins inside pipelines are supported for the **first stage only** (write the builtin's output to the pipe's write handle directly); builtins in later stages are rejected with a clear error. Document this as a divergence.
+
+**Errorlevel propagation:** the pipeline's exit code is the last stage's exit code. `Op` handling (`&&`, `||`) applies to the whole pipeline as one unit.
+
+**Native pipes mean no `cmd.exe` delegation, ever.** This is the commit that closes ChatGPT-6's objection.
+
+### 4.6 Redirection — full implementation
+
+`<`, `>`, `>>`, `2>`, `2>>`, `2>&1`, `1>&2`, `>nul`, `2>nul`:
+
+- `<`: open the target file read-only; set as child's stdin.
+- `>`: open overwrite; set as stdout.
+- `>>`: open append; set as stdout.
+- `2>` / `2>>`: same for stderr.
+- `2>&1`: duplicate stdout handle as stderr (use `SetHandleInformation` and `DuplicateHandle`); set both to the same handle.
+- `>nul` / `2>nul`: `CreateFileW` on `NUL` device with the appropriate access.
+- Multiple redirects on one command are honored.
+
+File handles created by CmdX2 for redirection must be `SetHandleInformation(HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)` before being used as `SI.hStd*`. The executor closes them after `CreateProcessW` returns.
+
+### 4.7 `cmdx2_pathtest.dpr` — acceptance test child
+
+```pascal
+program cmdx2_pathtest;
+{$APPTYPE CONSOLE}
+uses Windows, SysUtils;
+var
+  Buf: PWideChar;
+  BufLen: DWORD;
+  N: DWORD;
+begin
+  BufLen := 1024;
+  while True do
+  begin
+    GetMem(Buf, BufLen * SizeOf(WideChar));
+    N := GetEnvironmentVariableW('PATH', Buf, BufLen);
+    if N >= BufLen then
+    begin
+      FreeMem(Buf);
+      BufLen := N + 1024;
+      Continue;
+    end;
+    Writeln(N);
+    FreeMem(Buf);
+    Break;
+  end;
+end.
+```
+
+### 4.8 Phase 2 acceptance — the milestone
+
+| Test | Expected |
+| :--- | :--- |
+| `cmdx2 /c cmdx2_pathtest.exe` with registry PATH 5,000 | Prints a number ≥ 5,000 |
+| Same with 8,191 | ≥ 8,191 |
+| Same with 8,192 | ≥ 8,192 (**proves the fix**) |
+| Same with 20,000 | ≥ 20,000 |
+| Same with 32,766 | ≥ 32,766 |
+| Same with 32,767 | ≥ 32,767 |
+| Same with 32,768 | Print actual; if >32,767 → warn "documented limit exceeded" |
+| `cmdx2 /c where.exe python` with a long PATH | Resolves and prints path |
+| `cmdx2 /c npm.cmd install` (spawns `cmd /c node …` via COMSPEC) | Succeeds; node found |
+| `cmdx2 /c echo a \| findstr a` with a long PATH | Prints `a` (native pipe) |
+| `cmdx2 path add "G:\New\Tool"` → verify → reopen `cmdx2 /c where newtool` | Finds `newtool` |
+| `cmdx2 path add` on a 8,100-char PATH → 8,200-char result | Warns at 8,191; succeeds |
+| `cmdx2 path add` on a 32,000-char PATH → 33,000-char result | Refuses with error; no write |
+| `cmdx2 path backup` → `cmdx2 path add …` → `cmdx2 path restore` | Original byte-identical, type preserved |
+| Machine PATH 10,000 + User PATH 10,000 → `cmdx2 /c cmdx2_pathtest.exe` | ≥ 20,000 (merged) |
+| Nested: `set PATH=C:\Override;%PATH%` then `cmdx2 /c echo %PATH%` | Shows override; does not re-read registry |
+| `=C:` survives: start from shell with `=C:=C:\Projects`; `cmdx2 /c cmdx2_pathtest.exe` | Child sees `=C:` (verified by extending `cmdx2_pathtest` to dump all entries) |
+
+**End of Phase 2: the original problem is solved.** Everything after is compatibility.
+
+---
+
+## 5. Phase 3 — Full Builtin Set (1 week)
+
+Every `cmd.exe` builtin listed in the original spec (§13) is implemented.
+
+### 5.1 File and directory
+
+`dir` (with `/a`, `/b`, `/s`, `/w`, `/p`, sort options), `cd`/`chdir`, `md`/`mkdir`, `rd`/`rmdir` (with `/s`, `/q`), `del`/`erase` (with `/f`, `/q`, `/s`), `copy` (with `/y`, `/v`), `xcopy`, `move`, `ren`/`rename`, `type`, `more`, `attrib`.
+
+### 5.2 Environment and shell
+
+`set`, `path`, `prompt` (via `SetConsolePrompt`? no—store in session, print in REPL), `title`, `color`, `cls`, `ver`, `vol`, `date`, `time`, `pause`, `exit` (with `/b`, exit code), `echo` (with `on`/`off` for batch, `%ERRORLEVEL%`), `shift`, `start` (with `/b`, `/wait`, `/d`, `/min`, `/max`, `/i`), `setlocal` (with `enabledelayedexpansion`, `disabledelayedexpansion`), `endlocal`.
+
+### 5.3 Diagnostic subcommands
+
+`cmdx2 path` (list), `cmdx2 path add/remove/list/check/backup/restore`, `cmdx2 which <cmd>`, `cmdx2 diagnose <cmd>`, `cmdx2 env-dump`, `cmdx2 reload` (re-reads registry, replaces session PATH).
+
+### 5.4 Phase 3 acceptance
+
+A 200-line batch script using `dir`, `copy`, `if exist`, `goto`, `call :label`, `for %%a in (...)` runs identically to `cmd.exe`. `cmdx2 diagnose <tool>` prints the block size, ceiling, and PATH contribution.
+
+---
+
+## 6. Phase 4 — Batch Interpreter (2–3 weeks)
+
+The batch interpreter is where compatibility is hardest. This phase is scoped to "works for real-world `.bat` files", not "byte-identical to cmd.exe".
+
+### 6.1 Batch frame
+
+On `cmdx2 file.bat arg1 arg2`:
+
+1. Read file into `Lines: TStringList`.
+2. Scan for labels (`:label` at line start, `::` comments excluded). Build `Labels: TDictionary<string, Integer>` (lowercased).
+3. Set `Arg0 := file.bat`, `Args := [arg1, arg2]`.
+4. `EchoState := True` unless first line is `@echo off`.
+5. Push frame onto `BatchStack`.
+6. Execute lines sequentially from line 1.
+
+### 6.2 Argument substitution
+
+- `%0` → `Arg0`.
+- `%1`–`%9` → `Args[0]`–`Args[8]`; if absent, empty.
+- `%*` → all args joined by space.
+- `%~dp0`, `%~f0`, `%~nx0`, `%~dp1`, `%~f1`, `%~nx1` etc. → for each numeric index, the `~` modifiers:
+  - `%~dpN` → drive and path.
+  - `%~fN` → full path.
+  - `%~nxN` → name and extension.
+  - `%~xN` → extension only.
+  - `%~nN` → name only.
+  - `%~dN` → drive only.
+  - `%~pN` → path only.
+
+Arguments with `~` modifier undergo `ExpandFileName` for full path forms.
+
+### 6.3 `if` / `else`
+
+Supported forms:
+
+- `if exist <path> <command>`
+- `if not exist <path> <command>`
+- `if errorlevel <n> <command>` (true if current errorlevel ≥ n)
+- `if not errorlevel <n> <command>`
+- `if defined <name> <command>`
+- `if not defined <name> <command>`
+- `if "<str1>"=="<str2>" <command>`
+- `if /i "<str1>"=="<str2>" <command>` (case-insensitive)
+- `if cmdextversion <n>` (rarely used; accepted and returns false)
+- `else` on same line: `if exist x (a) else (b)`.
+
+Parenthesized blocks supported: `if exist x (command1 & command2) else (command3)`.
+
+### 6.4 `goto` and labels
+
+`goto :label` — jump to `Labels['label']`. `goto :eof` — end of file (return from `call`). Non-label target: report error, do not jump.
+
+Labels are scanned once at frame push. Dynamic label definition is not supported (matches `cmd.exe`).
+
+### 6.5 `call`
+
+- `call :label args` — push return frame, set `Arg0 := :label`, `Args := args`, jump.
+- `call other.bat args` — nested batch execution; returns when `other.bat` completes.
+- `call` recursion depth capped at 32. Report error if exceeded.
+
+`goto :eof` or `exit /b` pops the return frame.
+
+### 6.6 `for`
+
+- `for %%X in (set) do <command>` — iterate words; `%%X` replaced with current word.
+- `for /d %%X in (set) do` — iterate directories.
+- `for /r [path] %%X in (set) do` — recursive.
+- `for /l %%X in (start,step,end) do` — numeric loop.
+- `for /f "delims=… tokens=…" %%X in (source) do` — `source` is a file, command, or string; parses lines with delimiters and tokens. This is the hardest form; implement documented behavior, skip undocumented quirks.
+
+All `for` forms support `@` suppression of echo, `&&`/`||` inside the body, and `call` inside the body. `for` variables are substituted in `ExpandVariables` at parse time using a `ForVarContext` stored in the batch frame.
+
+### 6.7 `echo off` / `@` / `rem` / `::`
+
+- `echo off`: set `EchoState := False`.
+- `echo on`: set `EchoState := True`.
+- `@` prefix: suppress echo of the current line only.
+- `rem` and `::`: ignored.
+
+### 6.8 Batch exit
+
+- End of file: pop frame; return to caller.
+- `exit /b [n]`: return to caller with errorlevel `n`.
+- `exit [n]`: exit the whole shell with `n`.
+- `goto :eof`: same as `exit /b`.
+- `call` return: pop frame.
+
+### 6.9 Phase 4 acceptance
+
+20 real `.bat` files from public sources (SS64 examples, common Windows toolchain scripts, `npm`-generated shims) run under both `cmd.exe` and `cmdx2`; output diffs limited to documented divergences.
+
+---
+
+## 7. Phase 5 — `cmdx2` Subcommands (1 week)
+
+Wired into `ExecuteBuiltinCommand` under `cmd` = `cmdx2`:
+
+| Command | Behavior |
+| :--- | :--- |
+| `cmdx2 path` | Print merged User and System PATH with lengths, entry count, source. |
+| `cmdx2 path list` | Numbered entries with source. |
+| `cmdx2 path add "dir"` | Registry write with verification (§4.2). |
+| `cmdx2 path remove "dir"` | Registry write with verification. |
+| `cmdx2 path check` | Duplicates, non-existent directories, length warnings. |
+| `cmdx2 path backup [file]` | Export `HKCU\Environment` via `reg.exe` + JSON sidecar. |
+| `cmdx2 path restore [file]` | Restore with verification and broadcast. |
+| `cmdx2 which <cmd>` | Full path, matched PATHEXT extension, PATH index. |
+| `cmdx2 diagnose <cmd>` | Block size, ceiling, attempt launch, report. |
+| `cmdx2 env-dump` | All variables with sizes; summary line. |
+| `cmdx2 reload` | Re-read registry, replace session PATH, clear caches. |
+
+---
+
+## 8. Phase 6 — Compatibility Corpus & Divergences (ongoing)
+
+### 8.1 Regression corpus
+
+A `tests/corpus/` directory of public batch files (from SS64, common build scripts, npm-generated shims, Windows SDK samples). A `run_corpus.ps1` script:
+
+1. For each file: run `cmd.exe /c <file>` and `cmdx2 /c <file>`.
+2. Capture stdout, stderr, exit code, filesystem changes (via `git status` in a scratch dir).
+3. Diff.
+4. Report: `PASS`, `DIVERGENCE <id>`, or `FAIL`.
+
+Corpus expands over time. Any new failure is either fixed or added to `DIVERGENCES.md`.
+
+### 8.2 Divergences (initial set)
+
+1. `cmd.exe`'s 8,191-character inheritance limit does not apply to CmdX2 children.
+2. `cmd.exe`'s 4,095-character GUI editor limit does not apply (registry writes bypass it).
+3. Environment block ceiling is the documented 32,767-char per-variable limit.
+4. `for /f` tokenization matches documented behavior; undocumented quirks not reproduced.
+5. Builtins inside pipelines: supported only in the first stage.
+6. `%~` argument modifiers: `%~dp`, `%~f`, `%~nx`, `%~x`, `%~n`, `%~d`, `%~p` supported; other modifiers (`%~s`, `%~a`, `%~t`, `%~z`) not.
+7. `setlocal` scoping matches `cmd.exe`; nesting depth is limited to 32.
+8. `%ERRORLEVEL%` expansion timing matches `cmd.exe` except under `enabledelayedexpansion`.
+9. `cmd /c` with no command exits 0 (behavior may differ by cmd version).
+10. `REG_EXPAND_SZ` expansion uses the calling process's environment; service-account launches may expand user PATH incorrectly.
+11. `cmdx2 path add` refuses to write values above 32,767 chars (no silent truncation).
+12. `ComSpec`-aware tools use CmdX2; tools that hardcode `System32\cmd.exe` bypass it.
+13. `start` with `/wait` waits; without, returns immediately (matches `cmd.exe`).
+14. Pipe stages after the first must be external programs, not builtins.
+
+### 8.3 `DIVERGENCES.md` structure
+
+Each entry: id, description, `cmd.exe` behavior, CmdX2 behavior, rationale, workaround if any.
+
+---
+
+## 9. Phase 7 — Deployment & COMSPEC (1 day + documentation)
+
+### 9.1 `CMDX2_SESSION` marker
+
+CmdX2 sets `CMDX2_SESSION=1` in every child's environment. Nested sessions detect it (with the non-empty-PATH guard from §4.3) and trust the inherited PATH.
+
+### 9.2 COMSPEC integration (opt-in, documented)
+
+`README.md` includes:
+
+```
+To make COMSPEC-aware tools use CmdX2:
+  PowerShell (as admin):
+    [Environment]::SetEnvironmentVariable(
+      'COMSPEC', 'C:\CmdX2\cmdx2.exe', 'Machine')
+
+To unset:
+    [Environment]::SetEnvironmentVariable('COMSPEC', $null, 'Machine')
+
+Limitations:
+  - Tools that hardcode C:\Windows\System32\cmd.exe bypass CmdX2.
+  - Windows Update and system repair expect the real cmd.exe at
+    COMSPEC; unset before running those.
+  - Elevated CmdX2's WM_SETTINGCHANGE broadcast may not reach
+    non-elevated Explorer.
+```
+
+### 9.3 Do not
+
+- Do not modify `System32\cmd.exe`.
+- Do not use IFEO.
+- Do not modify `App Paths` for cmd.exe.
+- Do not set `COMSPEC` automatically; the user opts in.
+
+---
+
+## 10. Test Suite — Complete Specification
+
+### 10.1 Unit tests (`TestCmdX2.dpr`)
+
+**Types & comparer:**
+- `TEnvKeyComparer.Equals('PATH', 'path')` is true.
+- Insert `PATH`, `Path`, `path`; count = 1.
+- `GetHashCode('PATH') = GetHashCode('path')`.
+
+**Environment:**
+- `LoadCurrentEnvironment` preserves `=C:=C:\Projects` and `=D:=D:\Development`.
+- `BuildEnvironmentBlockUTF16` produces null-terminated UTF-16LE with correct byte count.
+- Round-trip: build block, walk entries, reconstruct map, compare to source.
+
+**Parser:**
+- `echo hello` → 1 command, program `echo`, args `['hello']`.
+- `echo "hello world"` → args `['"hello world"']` (quotes preserved).
+- `echo a^b` → `a^b`.
+- `echo a&&echo b` → 2 commands, `OpAnd`.
+- `echo a||echo b` → 2 commands, `OpOr`.
+- `echo a&echo b` → 2 commands, `OpSeq`.
+- `echo a > out.txt` → redirect `rhStdout`, target `out.txt`.
+- `echo a 2> err.txt` → redirect `rhStderr`, target `err.txt`.
+- `echo a 2>&1` → redirect `rhStderr` to `rhStdout` merge.
+- `echo a | findstr a` → 2 commands, `PipeToNext`.
+- `%PATH%` with `PATH=hello` → `hello`.
+- `%UNDEFINED%` → literal `%UNDEFINED%`.
+- `%%` at shell level → `%`.
+- `!PATH!` with delayed expansion off → literal `!PATH!`.
+- `!PATH!` with delayed expansion on → value.
+
+**Resolver:**
+- Absolute path with extension.
+- Absolute path without extension → PATHEXT applied.
+- Relative `.\tool.exe`.
+- `tool` found in first PATH entry → `PathIndex = 0`.
+- `tool` found in fifth PATH entry → `PathIndex = 4`.
+- `tool` found in current directory before PATH.
+- `tool` not found → returns False, `PathIndex = -1`.
+- Cache invalidation: resolve, change PATH, resolve again → new result.
+
+**Registry (mocked or real):**
+- `ReadPath` returns raw and type.
+- `WriteUserPath` with `REG_SZ`: type preserved.
+- `WriteUserPath` with `REG_EXPAND_SZ`: type preserved.
+- `WriteUserPath` over `CMDX2_ENV_VAR_LIMIT_CHARS`: returns False.
+- `WriteUserPath` verification mismatch: rolls back.
+
+**QuoteArg:**
+- `QuoteArg('')` = `""`.
+- `QuoteArg('hello')` = `hello`.
+- `QuoteArg('hello world')` = `"hello world"`.
+- `QuoteArg('a"b')` = `"a\"b"`.
+- Round-trip through `CommandLineToArgvW`.
+
+**Exec:**
+- `CreateProcessW` failure returns 9001.
+- Builtin failure returns builtin's code, not 9009.
+- Pipeline: `echo hi | findstr h` produces `hi`.
+- Redirection: `echo x > out` creates file with `x\n`.
+- `2>` capture: `echo err 2> err` leaves stdout empty, writes `err` to file.
+
+### 10.2 Integration tests
+
+| Test | Command | Expected |
+| :--- | :--- | :--- |
+| 20K PATH reaches native child | `cmdx2 /c cmdx2_pathtest.exe` | Number ≥ 20000 |
+| Registry round-trip | `cmdx2 path add`, reopen, verify | New entry present |
+| Backup/restore | `path backup`, `path add`, `path restore` | Original byte-identical |
+| Nested session | `cmdx2 /c "set PATH=C:\X;%PATH% && cmdx2 /c echo %PATH%"` | Shows override |
+| Pipe with long PATH | `cmdx2 /c "cmdx2_pathtest.exe \| findstr 20000"` | Prints `20000` |
+| Redirection with long PATH | `cmdx2 /c "cmdx2_pathtest.exe > out.txt"`, read | Number in file |
+| Batch file with goto | `goto_test.bat` | Correct branch |
+| Batch file with if | `if_test.bat` | Correct branch |
+| Batch file with for | `for_test.bat` | Correct iteration |
+| Batch file with call | `call_test.bat` | Correct recursion |
+
+### 10.3 Regression corpus
+
+See §8.1. 20+ batch files by end of Phase 4; expand over time.
+
+---
+
+## 11. Delivery Schedule and Honest Estimates
+
+Assuming one developer, focused:
+
+| Phase | Effort | Deliverable |
+| :--- | :--- | :--- |
+| 0 — Parser rewrite | 1 week | Tokenizer and parser pass unit tests |
+| 1 — Environment & shell correctness | 1 week | Interactive shell works for builtins |
+| **2 — Registry & long-PATH execution** | **2 weeks** | **Original problem solved; native pipes; acceptance tests pass** |
+| 3 — Full builtins | 1 week | All cmd builtins implemented |
+| 4 — Batch interpreter | 2–3 weeks | Common batch files run correctly |
+| 5 — `cmdx2` subcommands | 1 week | Full diagnostic interface |
+| 6 — Compatibility corpus | 2 weeks (then ongoing) | Corpus passes with documented divergences |
+| 7 — Deployment | 1 day | README, COMSPEC documentation, release build |
+
+**Time to solve the original problem: 4 weeks (end of Phase 2).**
+**Time to daily-driver quality: 10–12 weeks (end of Phase 5).**
+**Time to credible compatibility: 14–16 weeks (end of Phase 6).**
+**Ongoing: corpus growth, divergence reduction, community feedback.**
+
+These are honest. They are longer than earlier estimates because earlier estimates cut corners (deferred pipes, deferred batch, deferred registry management). This plan does not.
+
+---
+
+## 12. Open Questions Resolved
+
+1. **`REG_EXPAND_SZ` expansion context.** Machine PATH expanded via `ExpandEnvironmentStringsW` in the calling process's env. Documented: service-account launches may mis-expand user PATH. No workaround; out of scope.
+2. **`CMDX2_SESSION` depth.** Boolean, not counter. No overflow.
+3. **Pipeline builtins.** First stage only in v1; later stages rejected with clear error. Documented divergence.
+4. **Backup format.** `.reg` export plus JSON sidecar with raw value and type. Binary-safe.
+5. **Elevated broadcast.** Documented limitation; user reopens Explorer or logs out if changes don't propagate.
+6. **`cmd /c` with no command.** Exit 0; documented.
+7. **`%~` modifier set.** `dp`, `f`, `nx`, `x`, `n`, `d`, `p` supported. Others rejected with error.
+8. **Batch recursion depth.** 32 for `call` and `setlocal`. Exceeding produces error, not crash.
+
+---
+
+## 13. Success Criteria
+
+CmdX2 is complete when:
+
+1. A native child executed by `cmdx2 /c` receives a PATH of at least 20,000 characters via `GetEnvironmentVariableW`. **This is the primary proof.**
+2. `cmdx2 path add "dir"` writes to the registry, verifies, and broadcasts; reopening CmdX2 or Explorer shows the new entry.
+3. A 200-line batch script using `goto`, `if`, `for`, `call`, `setlocal` runs identically to `cmd.exe` aside from documented divergences.
+4. Native pipelines (`a | b | c`) work with a 20,000-character PATH; no delegation to `cmd.exe`.
+5. Redirections `<`, `>`, `>>`, `2>`, `2>>`, `2>&1` work correctly.
+6. `cmdx2 path backup` and `cmdx2 path restore` round-trip exactly, preserving `REG_SZ`/`REG_EXPAND_SZ` types.
+7. Nested sessions respect the `CMDX2_SESSION` policy.
+8. `=C:` drive-cwd entries survive to child processes.
+9. Environment map is case-insensitive (`PATH` = `path`).
+10. The regression corpus passes with divergences limited to those listed in `DIVERGENCES.md`.
+
+---
+
+## 14. What This Plan Does Not Compromise On
+
+- **Native pipes are in Phase 2**, not deferred. They are the reason delegation to `cmd.exe` is refused.
+- **Registry write verification** is mandatory, not optional.
+- **`=X:` preservation** is a regression test, not an afterthought.
+- **`TEnvKeyComparer`** is explicit, not delegated to RTL comparers of uncertain semantics.
+- **No silent truncation.** Every limit failure produces a message, a code, and options.
+- **Batch interpreter is scoped**, not stubbed. Common control flow works; uncommon forms are rejected explicitly.
+- **`CMDX2_SESSION` has the non-empty guard.** Empty inherited PATH from an intervening `cmd.exe` does not poison the session.
+- **COMSPEC integration is opt-in and documented**, not automatic.
+
+---
+
+## 15. First Deliverable
+
+The first concrete artifact is a Delphi 13 build of `cmdx2.exe` and `cmdx2_pathtest.exe` that, when launched from a shell with a 20,000-character registry PATH, prints `20000` or greater when running `cmdx2 /c cmdx2_pathtest.exe`. Everything else in this plan is downstream of that proof. Until that test passes, nothing else is validated.
+
+**Next action:** begin Phase 0. The parser rewrite is the first file. It is the foundation of every subsequent test.
+
+---
+
+**End of Plan v3. This is the development specification. No further architectural revisions.**

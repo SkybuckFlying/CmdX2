@@ -1,168 +1,182 @@
 unit CmdX2Types;
 
-{$IFDEF FPC}
-  {$MODE DELPHI}
-{$ENDIF}
+{$IFDEF FPC}{$MODE DELPHI}{$ENDIF}
 
 interface
 
 uses
-  SysUtils, Classes, Generics.Collections;
+  SysUtils, Classes, Generics.Collections, Generics.Defaults;
 
 type
-  ECmdX2Exception = class(Exception);
-
-  TExecStrategy = (esWarnAndProceed, esTrimSessionUsed, esShimDirectory, esRefuseAndExplain);
-
   TEnvironmentMap = TDictionary<string, string>;
 
-  TPathEntrySource = record
-    Path: string;
-    SourceFile: string;
-    Priority: Integer; // 1: Session, 2: Project, 3: Machine, 4: Global
+  TBatchReturnPoint = record
+    Line: Integer;
+    Arg0: string;
+    Args: TStringList;
   end;
 
-  TLimits = record
-    MeasuredCeiling: Int64; // bytes
-    ProbeSucceeded: Boolean;
-    CachedAt: TDateTime;
-    WindowsBuild: Integer;
-  end;
-
-  TProbeConfig = record
-    Enabled: Boolean;
-    CachedCeiling: Int64;
-  end;
-
-  TPathConfig = record
-    Entries: TStringList;
-    AppendSystem: Boolean;
-    Deduplicate: Boolean;
-    Normalize: Boolean;
-  end;
-
-  TPathextConfig = record
-    Extensions: TStringList;
-  end;
-
-  TConfig = record
-    PathConfig: TPathConfig;
-    PathextConfig: TPathextConfig;
-    ProbeConfig: TProbeConfig;
-    Strategy: TExecStrategy;
-    WarnThreshold: Double;
-  end;
-
-  TBatchContext = record
+  TBatchFrame = class
+  public
     FilePath: string;
+    Lines: TStringList;
     CurrentLine: Integer;
+    Labels: TDictionary<string, Integer>;
+    Arg0: string;
+    Args: TStringList;
+    EchoState: Boolean;
+    DelayedExpansionState: Boolean;
+    ReturnStack: TList<TBatchReturnPoint>;
+    constructor Create;
+    destructor Destroy; override;
   end;
 
-  TSession = record
+  TSession = class
+  public
     Environment: TEnvironmentMap;
+    MachineRawPath: string;
+    UserRawPath: string;
+    MachinePathType: string;
+    UserPathType: string;
     RawPath: string;
-    PathEntries: TList<TPathEntrySource>;
+    PathEntries: TList<string>;
     PathExtList: TStringList;
+    PerDriveCwd: TDictionary<Char, string>;
     Cwd: string;
-    Drive: Char;
     ErrorLevel: Integer;
-    SetLocalStack: TList<TEnvironmentMap>;
-    BatchStack: TList<TBatchContext>;
-    UsedEntries: TDictionary<string, Boolean>;
-    ResolverCache: TDictionary<string, string>;
-    Limits: TLimits;
-    Config: TConfig;
     ShouldExit: Boolean;
+    SetLocalStack: TList<TEnvironmentMap>;
+    DelayedExpansion: Boolean;
+    DelayedStack: TList<Boolean>;
+    BatchStack: TObjectList<TBatchFrame>;
+    DirectoryStack: TStringList;
+    ResolverCache: TDictionary<string, string>;
+    constructor Create;
+    destructor Destroy; override;
   end;
 
-  PSession = ^TSession;
+const
+  CMDX2_ENV_VAR_LIMIT_CHARS     = 32767;
+  CMDX2_CMD_INHERIT_LIMIT_CHARS = 8191;
+  CMDX2_CMDLINE_LIMIT_CHARS     = 32766;
+  CMDX2_MAX_PIPE_STAGES         = 64;
+  CMDX2_MAX_BATCH_RECURSION     = 32;
+  CMDX2_MAX_SETLOCAL_DEPTH      = 32;
+  CMDX2_MAX_GROUP_DEPTH         = 32;
 
-procedure InitConfig(var AConfig: TConfig);
-procedure FreeConfig(var AConfig: TConfig);
-procedure InitSession(var ASession: TSession);
-procedure FreeSession(var ASession: TSession);
+function NewEnvironmentMap: TEnvironmentMap;
 
 implementation
 
-procedure InitConfig(var AConfig: TConfig);
+function EnvKeysEqual(const L, R: string): Boolean;
 begin
-  AConfig.PathConfig.Entries := TStringList.Create;
-  AConfig.PathConfig.AppendSystem := True;
-  AConfig.PathConfig.Deduplicate := True;
-  AConfig.PathConfig.Normalize := True;
-
-  AConfig.PathextConfig.Extensions := TStringList.Create;
-  AConfig.PathextConfig.Extensions.Add('.COM');
-  AConfig.PathextConfig.Extensions.Add('.EXE');
-  AConfig.PathextConfig.Extensions.Add('.BAT');
-  AConfig.PathextConfig.Extensions.Add('.CMD');
-  AConfig.PathextConfig.Extensions.Add('.PS1');
-  AConfig.PathextConfig.Extensions.Add('.VBS');
-
-  AConfig.ProbeConfig.Enabled := True;
-  AConfig.ProbeConfig.CachedCeiling := 0;
-
-  AConfig.Strategy := esWarnAndProceed;
-  AConfig.WarnThreshold := 0.90;
+  Result := CompareText(L, R) = 0;
 end;
 
-procedure FreeConfig(var AConfig: TConfig);
+function EnvKeyHash(const V: string): Integer;
+var
+  Lower: string;
+  I: Integer;
+  H: Cardinal;
 begin
-  FreeAndNil(AConfig.PathConfig.Entries);
-  FreeAndNil(AConfig.PathextConfig.Extensions);
+  Lower := LowerCase(V);
+  H := 0;
+  // Hash accumulation intentionally wraps; disable overflow/range checks
+  // around this loop only. The directives restore the project defaults
+  // immediately after.
+{$IFOPT Q+}{$DEFINE RESTORE_Q}{$Q-}{$ENDIF}
+{$IFOPT R+}{$DEFINE RESTORE_R}{$R-}{$ENDIF}
+  for I := 1 to Length(Lower) do
+    H := H * 31 + Ord(Lower[I]);
+{$IFDEF RESTORE_Q}{$Q+}{$UNDEF RESTORE_Q}{$ENDIF}
+{$IFDEF RESTORE_R}{$R+}{$UNDEF RESTORE_R}{$ENDIF}
+  Result := Integer(H);
 end;
 
-procedure InitSession(var ASession: TSession);
+function NewEnvironmentMap: TEnvironmentMap;
+var
+  Comparer: IEqualityComparer<string>;
 begin
-  ASession.Environment := TEnvironmentMap.Create;
-  ASession.RawPath := '';
-  ASession.PathEntries := TList<TPathEntrySource>.Create;
-  ASession.PathExtList := TStringList.Create;
-  ASession.Cwd := GetCurrentDir;
-  if Length(ASession.Cwd) >= 1 then
-    ASession.Drive := ASession.Cwd[1]
-  else
-    ASession.Drive := 'C';
-  ASession.ErrorLevel := 0;
-  ASession.SetLocalStack := TList<TEnvironmentMap>.Create;
-  ASession.BatchStack := TList<TBatchContext>.Create;
-  ASession.UsedEntries := TDictionary<string, Boolean>.Create;
-  ASession.ResolverCache := TDictionary<string, string>.Create;
-  ASession.Limits.MeasuredCeiling := 65534;
-  ASession.Limits.ProbeSucceeded := False;
-  ASession.Limits.CachedAt := 0;
-  ASession.Limits.WindowsBuild := 0;
-  ASession.ShouldExit := False;
-
-  InitConfig(ASession.Config);
+  Comparer := TEqualityComparer<string>.Construct(EnvKeysEqual, EnvKeyHash);
+  Result := TEnvironmentMap.Create(Comparer);
 end;
 
-procedure FreeSession(var ASession: TSession);
+{ TBatchFrame }
+
+constructor TBatchFrame.Create;
+begin
+  inherited Create;
+  FilePath := '';
+  Lines := TStringList.Create;
+  CurrentLine := 0;
+  Labels := TDictionary<string, Integer>.Create;
+  Arg0 := '';
+  Args := TStringList.Create;
+  EchoState := True;
+  DelayedExpansionState := False;
+  ReturnStack := TList<TBatchReturnPoint>.Create;
+end;
+
+destructor TBatchFrame.Destroy;
 var
   I: Integer;
 begin
-  if Assigned(ASession.Environment) then
-    FreeAndNil(ASession.Environment);
-  if Assigned(ASession.PathEntries) then
-    FreeAndNil(ASession.PathEntries);
-  if Assigned(ASession.PathExtList) then
-    FreeAndNil(ASession.PathExtList);
+  Lines.Free;
+  Labels.Free;
+  Args.Free;
+  for I := 0 to ReturnStack.Count - 1 do
+    ReturnStack[I].Args.Free;
+  ReturnStack.Free;
+  inherited;
+end;
 
-  if Assigned(ASession.SetLocalStack) then
-  begin
-    for I := 0 to ASession.SetLocalStack.Count - 1 do
-      ASession.SetLocalStack[I].Free;
-    FreeAndNil(ASession.SetLocalStack);
-  end;
+{ TSession }
 
-  if Assigned(ASession.BatchStack) then
-    FreeAndNil(ASession.BatchStack);
-  if Assigned(ASession.UsedEntries) then
-    FreeAndNil(ASession.UsedEntries);
-  if Assigned(ASession.ResolverCache) then
-    FreeAndNil(ASession.ResolverCache);
+constructor TSession.Create;
+begin
+  inherited Create;
+  Environment := NewEnvironmentMap;
+  MachineRawPath := '';
+  UserRawPath := '';
+  MachinePathType := '';
+  UserPathType := '';
+  RawPath := '';
+  PathEntries := TList<string>.Create;
+  PathExtList := TStringList.Create;
+  PathExtList.Add('.COM');
+  PathExtList.Add('.EXE');
+  PathExtList.Add('.BAT');
+  PathExtList.Add('.CMD');
+  PathExtList.Add('.PS1');
+  PathExtList.Add('.VBS');
+  PerDriveCwd := TDictionary<Char, string>.Create;
+  Cwd := GetCurrentDir;
+  ErrorLevel := 0;
+  ShouldExit := False;
+  SetLocalStack := TList<TEnvironmentMap>.Create;
+  DelayedExpansion := False;
+  DelayedStack := TList<Boolean>.Create;
+  BatchStack := TObjectList<TBatchFrame>.Create(True);
+  DirectoryStack := TStringList.Create;
+  ResolverCache := TDictionary<string, string>.Create;
+end;
 
-  FreeConfig(ASession.Config);
+destructor TSession.Destroy;
+var
+  I: Integer;
+begin
+  Environment.Free;
+  PathEntries.Free;
+  PathExtList.Free;
+  PerDriveCwd.Free;
+  for I := 0 to SetLocalStack.Count - 1 do
+    SetLocalStack[I].Free;
+  SetLocalStack.Free;
+  DelayedStack.Free;
+  BatchStack.Free;
+  DirectoryStack.Free;
+  ResolverCache.Free;
+  inherited;
 end;
 
 end.

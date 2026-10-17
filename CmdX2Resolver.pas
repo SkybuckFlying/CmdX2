@@ -1,17 +1,15 @@
 unit CmdX2Resolver;
 
-{$IFDEF FPC}
-  {$MODE DELPHI}
-{$ENDIF}
+{$IFDEF FPC}{$MODE DELPHI}{$ENDIF}
 
 interface
 
 uses
-  SysUtils, Classes, CmdX2Types;
+  SysUtils, Classes, Generics.Collections, CmdX2Types;
 
-function ResolveCommand(var ASession: TSession; const ACmdName: string;
-  out AResolvedPath, AMatchedExt: string; out APathIndex: Integer): Boolean;
 function IsBuiltInCommand(const ACmdName: string): Boolean;
+function ResolveCommand(ASession: TSession; const ACmdName: string;
+  out AResolvedPath: string): Boolean;
 
 implementation
 
@@ -20,132 +18,87 @@ var
   Cmd: string;
 begin
   Cmd := LowerCase(Trim(ACmdName));
-  Result := (Cmd = 'dir') or (Cmd = 'cd') or (Cmd = 'chdir') or (Cmd = 'md') or (Cmd = 'mkdir') or
-            (Cmd = 'rd') or (Cmd = 'rmdir') or (Cmd = 'del') or (Cmd = 'erase') or (Cmd = 'copy') or
-            (Cmd = 'xcopy') or (Cmd = 'move') or (Cmd = 'ren') or (Cmd = 'rename') or (Cmd = 'type') or
-            (Cmd = 'more') or (Cmd = 'set') or (Cmd = 'path') or (Cmd = 'prompt') or (Cmd = 'title') or
-            (Cmd = 'color') or (Cmd = 'cls') or (Cmd = 'ver') or (Cmd = 'vol') or (Cmd = 'date') or
-            (Cmd = 'time') or (Cmd = 'pause') or (Cmd = 'exit') or (Cmd = 'echo') or (Cmd = 'shift') or
-            (Cmd = 'call') or (Cmd = 'goto') or (Cmd = 'start') or (Cmd = 'assoc') or (Cmd = 'ftype') or
-            (Cmd = 'setlocal') or (Cmd = 'endlocal') or (Cmd = 'pushd') or (Cmd = 'popd') or (Cmd = 'if') or
-            (Cmd = 'else') or (Cmd = 'for') or (Cmd = 'rem') or (Cmd = '::') or
-            (Cmd = 'cmdx2');
+  Result :=
+    (Cmd = 'dir') or (Cmd = 'cd') or (Cmd = 'chdir') or (Cmd = 'md') or
+    (Cmd = 'mkdir') or (Cmd = 'rd') or (Cmd = 'rmdir') or (Cmd = 'del') or
+    (Cmd = 'erase') or (Cmd = 'copy') or (Cmd = 'move') or (Cmd = 'ren') or
+    (Cmd = 'rename') or (Cmd = 'type') or (Cmd = 'set') or (Cmd = 'path') or
+    (Cmd = 'prompt') or (Cmd = 'title') or (Cmd = 'color') or (Cmd = 'cls') or
+    (Cmd = 'ver') or (Cmd = 'vol') or (Cmd = 'date') or (Cmd = 'time') or
+    (Cmd = 'pause') or (Cmd = 'exit') or (Cmd = 'echo') or (Cmd = 'shift') or
+    (Cmd = 'call') or (Cmd = 'goto') or (Cmd = 'start') or (Cmd = 'assoc') or
+    (Cmd = 'ftype') or (Cmd = 'setlocal') or (Cmd = 'endlocal') or
+    (Cmd = 'pushd') or (Cmd = 'popd') or (Cmd = 'if') or (Cmd = 'else') or
+    (Cmd = 'for') or (Cmd = 'rem') or (Cmd = 'cmdx2');
 end;
 
-function FileExistsCaseInsensitive(const APath: string): Boolean;
-begin
-  Result := FileExists(APath);
-end;
-
-function TryPathWithExtensions(const ABasePath: string; const AExtensions: TStringList;
-  out AMatchedPath, AMatchedExt: string): Boolean;
+function TryFind(const ABase: string; ASession: TSession; out APath: string): Boolean;
 var
   I: Integer;
-  Ext, Candidate: string;
+  Candidate: string;
 begin
   Result := False;
-  AMatchedPath := '';
-  AMatchedExt := '';
-
-  if FileExistsCaseInsensitive(ABasePath) and (not DirectoryExists(ABasePath)) then
+  APath := '';
+  if FileExists(ABase) and not DirectoryExists(ABase) then
   begin
-    AMatchedPath := ABasePath;
-    AMatchedExt := ExtractFileExt(ABasePath);
+    APath := ABase;
     Exit(True);
   end;
-
-  for I := 0 to AExtensions.Count - 1 do
+  for I := 0 to ASession.PathExtList.Count - 1 do
   begin
-    Ext := AExtensions[I];
-    if (Ext <> '') and (Ext[1] <> '.') then
-      Ext := '.' + Ext;
-
-    Candidate := ABasePath + Ext;
-    if FileExistsCaseInsensitive(Candidate) and (not DirectoryExists(Candidate)) then
+    Candidate := ABase + ASession.PathExtList[I];
+    if FileExists(Candidate) and not DirectoryExists(Candidate) then
     begin
-      AMatchedPath := Candidate;
-      AMatchedExt := Ext;
+      APath := Candidate;
       Exit(True);
     end;
   end;
 end;
 
-function CombinePath(const Dir, Name: string): string;
-begin
-  if Dir = '' then
-    Result := Name
-  else
-    Result := IncludeTrailingPathDelimiter(Dir) + Name;
-end;
-
-function ResolveCommand(var ASession: TSession; const ACmdName: string;
-  out AResolvedPath, AMatchedExt: string; out APathIndex: Integer): Boolean;
+function ResolveCommand(ASession: TSession; const ACmdName: string;
+  out AResolvedPath: string): Boolean;
 var
   I: Integer;
-  CleanCmd, CandidateBase, MatchedFile, Ext: string;
-  Entry: TPathEntrySource;
+  Name, Candidate: string;
 begin
   Result := False;
   AResolvedPath := '';
-  AMatchedExt := '';
-  APathIndex := -1;
+  Name := Trim(ACmdName);
+  if Name = '' then Exit;
 
-  CleanCmd := Trim(ACmdName);
-  if CleanCmd = '' then
+  if ASession.ResolverCache.TryGetValue(LowerCase(Name), AResolvedPath) then
+  begin
+    if FileExists(AResolvedPath) then Exit(True);
+    ASession.ResolverCache.Remove(LowerCase(Name));
+  end;
+
+  if (Pos('\', Name) > 0) or (Pos('/', Name) > 0) or
+     ((Length(Name) >= 2) and (Name[2] = ':')) then
+  begin
+    if TryFind(ExpandFileName(Name), ASession, AResolvedPath) then
+    begin
+      ASession.ResolverCache.AddOrSetValue(LowerCase(Name), AResolvedPath);
+      Exit(True);
+    end;
     Exit;
-
-  if ASession.ResolverCache.TryGetValue(LowerCase(CleanCmd), AResolvedPath) then
-  begin
-    if FileExistsCaseInsensitive(AResolvedPath) then
-    begin
-      AMatchedExt := ExtractFileExt(AResolvedPath);
-      Exit(True);
-    end
-    else
-      ASession.ResolverCache.Remove(LowerCase(CleanCmd));
   end;
 
-  if (Pos('\', CleanCmd) > 0) or (Pos('/', CleanCmd) > 0) or
-     ((Length(CleanCmd) >= 2) and (CleanCmd[2] = ':')) then
+  if not ASession.Environment.ContainsKey('NoDefaultCurrentDirectoryInExePath') then
   begin
-    CandidateBase := ExpandFileName(CleanCmd);
-    if TryPathWithExtensions(CandidateBase, ASession.Config.PathextConfig.Extensions, MatchedFile, Ext) then
+    Candidate := IncludeTrailingPathDelimiter(ASession.Cwd) + Name;
+    if TryFind(Candidate, ASession, AResolvedPath) then
     begin
-      AResolvedPath := MatchedFile;
-      AMatchedExt := Ext;
-      APathIndex := -1;
-      ASession.ResolverCache.AddOrSetValue(LowerCase(CleanCmd), AResolvedPath);
+      ASession.ResolverCache.AddOrSetValue(LowerCase(Name), AResolvedPath);
       Exit(True);
     end;
-    Exit(False);
-  end;
-
-  if (Copy(CleanCmd, 1, 2) = './') or (Copy(CleanCmd, 1, 2) = '.\') then
-  begin
-    CandidateBase := ExpandFileName(CleanCmd);
-    if TryPathWithExtensions(CandidateBase, ASession.Config.PathextConfig.Extensions, MatchedFile, Ext) then
-    begin
-      AResolvedPath := MatchedFile;
-      AMatchedExt := Ext;
-      APathIndex := -1;
-      ASession.ResolverCache.AddOrSetValue(LowerCase(CleanCmd), AResolvedPath);
-      Exit(True);
-    end;
-    Exit(False);
   end;
 
   for I := 0 to ASession.PathEntries.Count - 1 do
   begin
-    Entry := ASession.PathEntries[I];
-    CandidateBase := CombinePath(Entry.Path, CleanCmd);
-
-    if TryPathWithExtensions(CandidateBase, ASession.Config.PathextConfig.Extensions, MatchedFile, Ext) then
+    Candidate := IncludeTrailingPathDelimiter(ASession.PathEntries[I]) + Name;
+    if TryFind(Candidate, ASession, AResolvedPath) then
     begin
-      AResolvedPath := MatchedFile;
-      AMatchedExt := Ext;
-      APathIndex := I;
-      ASession.UsedEntries.AddOrSetValue(Entry.Path, True);
-      ASession.ResolverCache.AddOrSetValue(LowerCase(CleanCmd), AResolvedPath);
+      ASession.ResolverCache.AddOrSetValue(LowerCase(Name), AResolvedPath);
       Exit(True);
     end;
   end;
