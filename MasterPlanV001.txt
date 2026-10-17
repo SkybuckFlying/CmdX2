@@ -1,0 +1,938 @@
+# CmdX2 as a Full cmd.exe Replacement — Master Plan
+
+**Goal:** `cmdx2.exe` becomes a complete cmd.exe-compatible shell that can be renamed to `cmd.exe`, installed as the system command interpreter, and used as the default shell in every context where `cmd.exe` is invoked — by the user, by Windows, by third-party tools, and by Windows components.
+
+**Prerequisite:** Milestone A is complete and proven. This document covers Milestones B–G, from the current launcher to full replacement.
+
+---
+
+## 0. Framing: Two Distinct Goals
+
+| Goal | What it means | Deployment method |
+| :--- | :--- | :--- |
+| **Capable shell** | A cmd.exe-compatible interpreter the user runs explicitly. | None — user calls `cmdx2.exe` when they want it. |
+| **System replacement** | `cmd.exe` itself is `cmdx2.exe`. Every invocation — user, Windows, third-party — gets CmdX2. | `COMSPEC`, PATH, or file replacement. |
+
+These are separate achievements. The first is a shell project. The second is a deployment project with real risk. This plan delivers the first fully, then offers the second with graduated options.
+
+**Critical sequencing:** Batch interpretation (Milestone D) is a **hard prerequisite** for any deployment. Without it, every `.bat` and `.cmd` file a tool invokes would fail, because CmdX2 would either not run them or would delegate to a real `cmd.exe` that discards the long PATH. Deployment cannot begin until batch works.
+
+---
+
+## 1. Current State (Milestone A — complete)
+
+What works:
+- Registry read (HKLM + HKCU), merge, deduplication, `REG_EXPAND_SZ` expansion
+- `--path-file` override for reproducible testing
+- `CreateProcessW` with `CREATE_UNICODE_ENVIRONMENT` and `STARTUPINFOEX` with explicit handle list
+- 22,719-char PATH delivered to native children, byte-identical, registry untouched (proven by safety test)
+- Correct `WinQuoteArg`, case-insensitive env map, per-drive `=X:` preservation
+- Tokenizer handles all operators and redirect forms
+- Interactive prompt with `echo`, `set`, `path`, `exit`, `ver`, `cmdx2 limits`, `cmdx2 env-dump`
+- Basic resolver (PATHEXT, cwd rule, cache)
+
+What does not work:
+- Pipes, redirection execution, `&&`/`||`/`&` sequencing (parsed, not executed)
+- Batch files (`.bat`, `.cmd`)
+- Most builtins (`dir`, `cd`, `copy`, `type`, etc.)
+- Registry write CLI (`cmdx2 path add/remove/backup/restore`)
+- Line editing, history, tab completion
+- Ctrl+C / Ctrl+Break handling
+- Any deployment mechanism
+
+---
+
+## 2. Milestone B — Execution Engine (3–4 weeks)
+
+**Goal:** every parsed construct from the tokenizer actually executes. After B, CmdX2 is a functional shell for single commands, pipelines, and redirection.
+
+### 2.1 New unit: `CmdX2Streams.pas`
+
+The key abstraction. Builtins and external commands both write to a stream, so a builtin's output can be piped and a child's output can be redirected. Without this, pipelines that mix builtins and external commands cannot work.
+
+```pascal
+type
+  IOutputStream = interface
+    procedure Write(const S: string);
+    procedure WriteLn(const S: string = '');
+    function Handle: THandle;  // INVALID_HANDLE_VALUE for non-file-backed
+    procedure Flush;
+  end;
+
+  IInputStream = interface
+    function ReadLine(out S: string): Boolean;
+    function Handle: THandle;
+  end;
+
+  TConsoleOutputStream = class(TInterfacedObject, IOutputStream)
+    // Writes to GetStdHandle(STD_OUTPUT_HANDLE) or STD_ERROR_HANDLE
+  end;
+
+  TPipeOutputStream = class(TInterfacedObject, IOutputStream)
+    // Writes to a pipe write handle
+  end;
+
+  TFileOutputStream = class(TInterfacedObject, IOutputStream)
+    // Writes to a file handle with overwrite/append mode
+  end;
+
+  TNulOutputStream = class(TInterfacedObject, IOutputStream)
+    // Discards writes
+  end;
+```
+
+Every builtin that produces output changes from `Writeln(...)` to `AContext.StdOut.WriteLn(...)`. This is mechanical but touches every builtin.
+
+### 2.2 Pipeline engine — `CmdX2Exec.pas`
+
+Replace the current single-command launcher with a pipeline executor:
+
+```
+ExecutePipeline(ASession, Stages: TParsedCommandLine): Integer
+  if Length(Stages) > CMDX2_MAX_PIPE_STAGES then fail
+  Create N-1 anonymous pipes (both ends inheritable)
+  For each stage i:
+    In  = (i=0)   ? console-input  : pipe[i-1].read
+    Out = (i=N-1) ? console-output : pipe[i].write
+    Err = console-error
+    Apply redirections to (In, Out, Err) in order
+    If stage is builtin:
+      Builtin writes to Out (via IOutputStream)
+      Child's In/Out/Err handles are captured but not used for external processes
+    Else:
+      Resolve path, launch with STARTUPINFOEX + handle list (In, Out, Err)
+  Close parent pipe handles
+  Wait for all children (chunked for >64)
+  Return last stage's exit code
+```
+
+### 2.3 Redirection application — already mostly correct
+
+`LaunchWithExplicitBlock` already applies redirects. Move the application out of that function into a `PrepareHandles` helper so the pipeline executor can use it, then pass pre-prepared handles to `LaunchWithExplicitBlock` (which then does not apply redirects — single owner).
+
+### 2.4 Operator sequencing — `CmdX2Exec.pas`
+
+```
+ExecuteCommandLine(ASession, Cmds: TParsedCommandLine): Integer
+  LastExit := 0
+  For each Cmd in Cmds:
+    Case Cmd.Op of
+      opAnd: if LastExit <> 0 then Continue
+      opOr:  if LastExit = 0 then Continue
+      opSeq: // no condition
+    End
+    LastExit := ExecutePipelineOrSingle(ASession, Cmd)
+    ASession.ErrorLevel := LastExit
+  End
+  Result := LastExit
+```
+
+### 2.5 Ctrl+C and Ctrl+Break handling
+
+`SetConsoleCtrlHandler` installs a handler that:
+- On `CTRL_C_EVENT`: terminates the current foreground child's process group (`GenerateConsoleCtrlEvent(CTRL_C_EVENT, childGroupId)`), returns True to indicate handled
+- On `CTRL_BREAK_EVENT`: same, but returns False so the shell also exits if no child
+- On `CTRL_CLOSE_EVENT` / `CTRL_LOGOFF_EVENT` / `CTRL_SHUTDOWN_EVENT`: same as Break
+
+Requires `CREATE_NEW_PROCESS_GROUP` on child launches so signals can be targeted. Requires careful handling of pipes (close pipes so blocked readers wake up).
+
+### 2.6 `cmdx2 path` subcommands
+
+Wire the existing `CmdX2Registry.pas` functions into the CLI:
+
+| Command | Behavior |
+| :--- | :--- |
+| `cmdx2 path` | Print merged User + System PATH, lengths, entry count |
+| `cmdx2 path list` | Numbered entries with source (machine/user) |
+| `cmdx2 path add "dir"` | Read, deduplicate, append, write, verify, broadcast, update session |
+| `cmdx2 path remove "dir"` | Read, filter, write, verify, broadcast, update session |
+| `cmdx2 path check` | Duplicates, non-existent dirs, length warnings |
+| `cmdx2 path backup [file]` | `.reg` export + JSON sidecar |
+| `cmdx2 path restore [file]` | Restore from backup with verification |
+| `cmdx2 which <cmd>` | Full path, extension, PATH index |
+| `cmdx2 diagnose <cmd>` | Block size, ceiling, attempt launch, report |
+| `cmdx2 env-dump` | All variables with sizes |
+| `cmdx2 reload` | Re-read registry, replace session PATH |
+
+### 2.7 Acceptance
+
+- `cmdx2 /c "echo a | findstr a"` prints `a` (native pipe, no delegation)
+- `cmdx2 /c "echo a && echo b"` prints both
+- `cmdx2 /c "exit /b 1 && echo no || echo yes"` prints `yes`
+- `cmdx2 /c "echo a > out.txt 2>&1"` — file contains `a`
+- `cmdx2 /c "prog < in.txt > out.txt"` — stdin/stdout redirection
+- `cmdx2 /c "dir | sort | more"` — builtins in pipes work
+- Safety test still passes (regression guard)
+- Ctrl+C during a child interrupts the child, not CmdX2
+- Pipeline >64 stages → error 9003
+- `cmdx2 path add` verified and rolled back correctly on simulated failure
+
+---
+
+## 3. Milestone C — Full Builtin Set (2–3 weeks)
+
+**Goal:** every builtin that `cmd.exe` implements natively.
+
+### 3.1 Genuine cmd.exe builtins (the actual list)
+
+Per Microsoft's documentation, the following are cmd.exe builtins (not external `.exe` files):
+
+| Category | Builtins |
+| :--- | :--- |
+| **Directory** | `cd`, `chdir`, `dir`, `md`, `mkdir`, `rd`, `rmdir`, `pushd`, `popd` |
+| **File** | `copy`, `del`, `erase`, `move`, `ren`, `rename`, `type`, `mklink` |
+| **Environment** | `set`, `path`, `setlocal`, `endlocal` |
+| **Shell** | `cls`, `color`, `date`, `time`, `echo`, `exit`, `pause`, `prompt`, `title`, `ver`, `verify`, `vol` |
+| **Control** | `call`, `goto`, `if`, `for`, `rem`, `shift`, `start` |
+| **Registration** | `assoc`, `ftype` |
+| **Comment** | `::` |
+| **No-op** | `break` |
+
+### 3.2 External programs (resolved via PATH, not builtins)
+
+`xcopy`, `robocopy`, `more`, `find`, `findstr`, `where`, `attrib`, `tree`, `fc`, `comp`, `mklink` (external on some paths), `ping`, `ipconfig`, `net`, `tasklist`, `taskkill`, `sc`, `schtasks`, `timeout`, `choice`, `wmic`, `reg`, `regedit`, `dxdiag`, `systeminfo` — these are `.exe` files in `System32` or `SysWOW64` and resolve through `ResolveCommand`. **Do not** implement them as builtins — that would shadow the system versions and break compatibility.
+
+### 3.3 Builtin implementation strategy
+
+Each builtin:
+
+1. Receives an `IOutputStream` for stdout and stderr
+2. Returns an Integer error level
+3. Does not call `Writeln` directly — uses the stream
+4. Handles its own `/a`, `/b`, `/s`, `/w` etc. flags as documented
+5. Has a unit test that verifies output and error level
+
+### 3.4 `dir` — the hardest builtin
+
+`dir` has:
+- 9 flag combinations: `/A`, `/B`, `/D`, `/L`, `/N`, `/O`, `/P`, `/Q`, `/R`, `/S`, `/T`, `/W`, `/X`, `/4`, `/-C`
+- Sorting by name, extension, date, size, grouping
+- Column widths, file size formatting (thousands separators)
+- Date/time format from locale
+- Recursive listing
+- Different display for bare (no args), wildcard, and path args
+- Symlink/reparse point display
+- Header/footer format
+
+Implement the common cases first: `dir`, `dir /a`, `dir /b`, `dir /s`, `dir /w`, `dir /o:name`, `dir /o:size`, `dir /o:date`. Defer `/-C`, `/-N` etc. as documented divergences.
+
+### 3.5 `start` — the second hardest
+
+`start` options:
+- `/B`, `/D dir`, `/I`, `/MAX`, `/MIN`, `/NODE`, `/REALTIME`, `/WAIT`, `/LOW`, `/NORMAL`, `/HIGH`, `/ABOVENORMAL`, `/BELOWNORMAL`, `/AFFINITY`
+- Title as first argument (if quoted and not a path)
+- Detached vs. waited launch
+- Window state control
+- `start "" cmd.exe` — the empty-title idiom
+
+Also handles:
+- Bare `start` — opens new console
+- `start file.txt` — uses file association via `ShellExecuteEx`
+- `start url` — opens in default browser
+- `start /b prog` — no new window
+
+### 3.6 Builtins requiring parent-child interaction
+
+`call` and `goto` only work in batch context (Milestone D). `shift` in interactive context is a no-op with a warning. `setlocal`/`endlocal` at interactive level push/pop environment snapshots (already implemented partially).
+
+### 3.7 Acceptance
+
+For every builtin:
+- Unit test for basic output
+- Unit test for each documented flag
+- Error-level test for failure modes
+- Manual comparison against `cmd.exe` output for the common cases
+
+Corpus test: 50+ short scripts using each builtin, run under both `cmd.exe` and `cmdx2`, diffed. Divergences documented in `DIVERGENCES.md`.
+
+---
+
+## 4. Milestone D — Batch Interpreter (4–6 weeks)
+
+**Goal:** `.bat` and `.cmd` files run correctly. This is the hard prerequisite for deployment.
+
+### 4.1 The frame model
+
+A batch file executes inside a `TBatchFrame` (already declared):
+
+```pascal
+TBatchFrame = class
+  FilePath: string;
+  Lines: TStringList;              // loaded with encoding detection
+  CurrentLine: Integer;
+  Labels: TDictionary<string, Integer>;   // lowercased → line index
+  Arg0: string;                    // %0
+  Args: TStringList;               // %1..%9
+  EchoState: Boolean;              // @echo off
+  DelayedExpansionState: Boolean;  // setlocal enabledelayedexpansion
+  ReturnStack: TList<TBatchReturnPoint>;  // for call :label
+end;
+
+TBatchReturnPoint = record
+  Line: Integer;                   // line to resume at
+  Arg0: string;
+  Args: TStringList;               // copy of frame args at call time
+end;
+```
+
+`BatchStack: TObjectList<TBatchFrame>` in `TSession` holds the frame stack. Up to 32 frames deep (matches `cmd.exe`).
+
+### 4.2 Execution loop
+
+```
+ExecuteBatchFile(ASession, APath, AArgs):
+  F := LoadFrame(APath, AArgs)
+  BatchStack.Add(F)
+  try
+    while (F.CurrentLine < F.Lines.Count) and not ASession.ShouldExit do
+      Line := F.Lines[F.CurrentLine]
+      HandleBatchLine(ASession, F, Line)
+      if not ControlFlowRedirected(F) then
+        Inc(F.CurrentLine)
+  finally
+    BatchStack.Remove(F)
+    F.Free
+  end
+```
+
+### 4.3 Line classification
+
+For each line:
+
+1. Empty → skip
+2. `::comment` or `rem comment` → skip
+3. `:label` → skip (labels were pre-scanned)
+4. `@echo off` / `@echo on` → toggle `F.EchoState`
+5. `@` prefix → suppress echo of this line
+6. If `F.EchoState`, echo the line (before execution)
+7. Tokenize, expand, dispatch
+
+### 4.4 Control flow
+
+**`goto :label`:**
+```
+If target = ':eof' or target = '' → EndOfFile(F)
+Else if F.Labels.TryGetValue(lowercase(target), idx):
+  F.CurrentLine := idx + 1
+Else
+  Print "The system cannot find the batch label specified - " + target
+  Set ExitCode 1
+```
+
+**`call :label`:**
+```
+Push ReturnPoint(F.CurrentLine, F.Arg0, CloneArgs(F.Args))
+F.Arg0 := target
+F.Args := ParseCallArgs(rest of line)
+F.CurrentLine := F.Labels[target] + 1
+```
+
+**`call other.bat args`:**
+```
+ExecuteBatchFile(ASession, target, ParseCallArgs(rest of line))
+```
+
+**`exit /b [n]`:**
+```
+If ReturnStack.Count > 0:
+  Pop ReturnPoint → restore F.CurrentLine, F.Arg0, F.Args
+Else
+  EndOfFile(F)
+If n provided: ASession.ErrorLevel := n
+```
+
+**`goto :eof`:**
+```
+EndOfFile(F) → if ReturnStack.Count > 0: pop; else pop frame
+```
+
+### 4.5 `if` / `else`
+
+Supported forms:
+- `if exist <path> <command>`
+- `if not exist <path> <command>`
+- `if errorlevel <n> <command>` — true if `%ERRORLEVEL%` ≥ n
+- `if not errorlevel <n> <command>`
+- `if defined <name> <command>`
+- `if not defined <name> <command>`
+- `if "<a>"=="<b>" <command>` — case-sensitive
+- `if /i "<a>"=="<b>" <command>` — case-insensitive
+- `if cmdextversion <n> <command>` — accepted, returns False
+- Grouped: `if <cond> (<cmd1> & <cmd2>) else (<cmd3>)`
+- Nested grouping up to `CMDX2_MAX_GROUP_DEPTH`
+
+### 4.6 `for` loops
+
+- `for %%X in (<set>) do <command>` — words
+- `for /d %%X in (<pattern>) do` — directories
+- `for /r [path] %%X in (<set>) do` — recursive files
+- `for /l %%X in (<start>,<step>,<end>) do` — numeric range
+- `for /f ["options"] %%X in (<source>) do` — line-based parsing
+  - Options: `delims=`, `tokens=`, `eol=`, `skip=`, `usebackq`
+  - Source: string (`"..."`), file (`'file'`), command (`'cmd'`)
+- Nested loops: use a distinct loop variable per depth
+- `%%X` in a loop body expands to the current value at each iteration
+
+### 4.7 Argument substitution — the grammar
+
+In any command (batch only):
+- `%0` → `F.Arg0`
+- `%1` … `%9` → `F.Args[N-1]` or empty
+- `%*` → all args joined by space
+- `%N` where N > 9 → not supported, treated literally (matches cmd)
+- `%~` modifiers on `%0` … `%9`:
+  - `f` — full path
+  - `d` — drive letter
+  - `p` — path (no drive)
+  - `n` — file name (no extension)
+  - `x` — extension
+  - `s` — short (8.3) path
+  - `a` — file attributes
+  - `t` — file date/time
+  - `z` — file size
+  - Combinations: `%~dp0` = drive+path of batch file (the most common idiom), `%~nx0` = batch file name and extension
+
+Delphi helper:
+```pascal
+function ExpandArgModifier(const Modifiers, ArgNum: string): string;
+```
+
+### 4.8 Encoding detection
+
+- UTF-8 BOM (`EF BB BF`) → decode as UTF-8
+- UTF-16 LE BOM (`FF FE`) → decode as UTF-16 LE
+- UTF-16 BE BOM (`FE FF`) → decode as UTF-16 BE
+- No BOM → decode as ANSI (system code page)
+- Document that non-ASCII batch files without a BOM may decode incorrectly
+
+### 4.9 `setlocal` / `endlocal` in batch
+
+`setlocal`:
+- Push a full copy of `ASession.Environment` to `ASession.SetLocalStack`
+- Push `F.DelayedExpansionState` to `ASession.DelayedStack`
+- If `enabledelayedexpansion` argument present, set `F.DelayedExpansionState := True`
+- If `disabledelayedexpansion`, set to False
+- If `setlocal` without arguments, both stacks updated with current values
+- Depth limit `CMDX2_MAX_SETLOCAL_DEPTH`
+
+`endlocal`:
+- If `SetLocalStack.Count > 0`: pop and replace `ASession.Environment`
+- If `DelayedStack.Count > 0`: pop and restore `F.DelayedExpansionState`
+- At frame end (end of batch or `exit /b`), all frame's `setlocal` scopes are discarded
+
+### 4.10 Acceptance
+
+| Test | Source |
+| :--- | :--- |
+| `goto` + labels | A batch with 5 labels and forward/backward jumps |
+| `call :label` + `exit /b` | A recursive factorial function |
+| `call other.bat args` | Nested batch with argument passing |
+| `if exist` / `if errorlevel` / `if defined` | A test batch exercising each |
+| `for %%a in (...) do` | Iterating a file list |
+| `for /l` | Counting from 1 to 100 |
+| `for /f "tokens=2 delims=," %%a` | Parsing a CSV |
+| `%~dp0` | A batch that runs a program from its own directory |
+| `setlocal enabledelayedexpansion` + `!var!` | A loop with per-iteration variable updates |
+| Nested `setlocal` | Scope test |
+| UTF-8 BOM batch file | Batch with accented filenames |
+| Batch file spawned by an external tool | `cmdx2 /c "some-tool.exe"` where the tool spawns `cmd.exe /c batch.bat` |
+
+Corpus test: 20–50 real `.bat` files from SS64, npm-generated shims, common build scripts. Compare output and error levels with `cmd.exe`. Documented divergences are acceptable; unrecorded failures are bugs.
+
+---
+
+## 5. Milestone E — Shell UX (3–4 weeks)
+
+**Goal:** CmdX2 is pleasant to use interactively. Without this, it is technically correct but tiring.
+
+### 5.1 Line editing and history
+
+Replace `Readln` with a custom line reader using `ReadConsoleInputW` on a dedicated thread. Features:
+
+- **Left/Right arrow** — cursor movement
+- **Home/End** — line start/end
+- **Up/Down arrow** — command history (session-only, plus optional persistent history file at `%APPDATA%\CmdX2\history.txt`)
+- **Ctrl+Left / Ctrl+Right** — word movement
+- **Ctrl+A / Ctrl+E** — start/end (readline-like)
+- **Ctrl+U / Ctrl+K** — delete to start/end
+- **Ctrl+W** — delete word
+- **Insert / Delete** — insert vs. overwrite mode, char delete
+- **Backspace** — char delete
+- **F7** — history picker popup
+- **F8** — search history by prefix
+- **Escape** — clear line
+- **Tab** — completion (see 5.2)
+- **Ctrl+C** — interrupt current input, or interrupt foreground child
+- **Ctrl+D** — end-of-input, exit (if line is empty)
+- **Ctrl+L** — clear screen (alias for `cls`)
+
+### 5.2 Tab completion
+
+Candidate sources, in order:
+1. Builtin names
+2. Files in the current directory (matching pattern)
+3. Directories in the current directory (with trailing `\`)
+4. Commands resolvable via `ResolveCommand` (from PATH)
+5. `set` completion — `%VAR%` names after `set `, `echo %VAR` etc.
+
+Behavior:
+- First Tab → complete to longest common prefix
+- Subsequent Tabs → cycle through candidates
+- Shift+Tab → cycle backwards
+- Display candidate list if > 1 candidate and the line has no changes after first Tab
+
+### 5.3 Prompt rendering
+
+Prompt string supports `cmd.exe` expansion codes:
+- `$P` — current drive and path
+- `$N` — current drive
+- `$G` — `>`
+- `$L` — `<`
+- `$B` — `|`
+- `$Q` — `=`
+- `$T` — current time
+- `$D` — current date
+- `$V` — Windows version
+- `$U` — user name
+- `$A` — `&`
+- `$C` — `(`
+- `$F` — `)`
+- `$S` — space
+- `$_` — newline
+- `$E` — Escape (for ANSI)
+- `$H` — Backspace
+
+Default prompt: `$P$G` (matches cmd.exe).
+
+`prompt <string>` sets it. `prompt` with no args resets to default.
+
+### 5.4 Console features
+
+- **AutoRun** — read `HKLM\Software\Microsoft\Command Processor\AutoRun` and `HKCU\Software\Microsoft\Command Processor\AutoRun`, execute as if typed before each interactive session
+- **DOSKEY macros** — read from AutoRun registry, define `name=expansion` macros that expand before tokenization
+- **VT processing** — enable `ENABLE_VIRTUAL_TERMINAL_PROCESSING` on startup if available
+- **Console mode** — `ENABLE_PROCESSED_INPUT`, `ENABLE_LINE_INPUT` off (custom reader), `ENABLE_ECHO_INPUT` off
+- **Ctrl+C child signal** — `GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0)` to signal the whole console group; CmdX2 handles its own interrupt and terminates the foreground child
+- **Alt+Enter fullscreen** — handled by Windows, no work needed
+- **Window title** — `title` builtin sets via `SetConsoleTitleW`
+
+### 5.5 Persistent history
+
+`%APPDATA%\CmdX2\history.txt` — one line per command, deduplicated, capped at 1,000 entries. Loaded on startup, appended on each executed command. Ctrl+R not required initially (deferred).
+
+### 5.6 Acceptance
+
+- Type `dir`, Tab completes to `dir` if unique or cycles candidates
+- Up arrow recalls the last 100 commands
+- F7 shows history picker
+- Prompt customization works with all `$X` codes
+- AutoRun executes from registry on startup
+- DOSKEY macro `d=dir /w` expands when `d` is typed
+- Ctrl+C during `ping -t` interrupts the ping, returns to prompt
+- Ctrl+C at an empty prompt does nothing (or prints `^C` and new prompt)
+
+---
+
+## 6. Milestone F — Compatibility and Hardening (4–6 weeks, ongoing)
+
+**Goal:** the shell survives real-world use. Compatible enough that users stop reaching for `cmd.exe`.
+
+### 6.1 Corpus expansion
+
+Maintain `tests/corpus/` with at least:
+- 50 batch files from public sources (SS64, superuser, Stack Overflow)
+- 10 npm-generated shims
+- 10 Python pip-generated `.cmd` wrappers
+- 10 cargo/rustup-generated scripts
+- 10 cmake-generated scripts
+- 10 Windows SDK sample scripts
+- 10 user-contributed real-world scripts
+
+`run_corpus.ps1` runs each under both `cmd.exe` and `cmdx2`, diffs output/errorlevel/filesystem state. Report format:
+- `PASS` — byte-identical or documented divergence
+- `DIVERGENCE <id>` — matches a documented difference
+- `FAIL` — unexpected difference, becomes a bug
+
+### 6.2 Real toolchain integration tests
+
+Run each of these end-to-end with `cmdx2` as `COMSPEC`:
+
+| Toolchain | Test |
+| :--- | :--- |
+| Node.js | `npm init`, `npm install`, `npm run build` |
+| Python | `pip install`, `python -m venv`, activating venv, `python -m pytest` |
+| Rust | `cargo new`, `cargo build`, `cargo test` |
+| Go | `go build`, `go test` |
+| .NET | `dotnet build`, `dotnet test`, `dotnet publish` |
+| CMake | `cmake -B build && cmake --build build` |
+| MSBuild | `.sln` build |
+| Git | `git clone`, `git submodule update`, pre-commit hooks |
+| Delphi | `dcc32` from a `.dpr` in a shell-spawned build script |
+| PowerShell | `pwsh -Command "..."` interop |
+
+Any failure is either a CmdX2 bug or a documented divergence.
+
+### 6.3 Error handling
+
+- **Child crash** — CmdX2 does not crash; sets errorlevel, prints `(process returned 0xC0000005)` if abnormal
+- **Child killed by Ctrl+C** — errorlevel 0xC000013A, CmdX2 continues
+- **Handle leak test** — 1,000 sequential launches, verify handle count stable
+- **Memory leak test** — 1,000 sequential commands, verify memory stable
+- **Command line too long** — > 32,766 characters → error, not crash
+- **Environment too large** — any variable > 32,767 → error with named variable
+- **Path not found** — clear error, not crash
+- **Permission denied** — clear error, errorlevel
+
+### 6.4 Performance
+
+- `cmdx2 /c echo hello` should complete in < 100 ms on a modern CPU
+- Registry read on startup should be < 20 ms
+- Interactive prompt should feel instant (no visible lag)
+- 10,000-entry PATH resolution should be < 50 ms
+- Batch files with 1,000 lines should run at least as fast as `cmd.exe`
+
+### 6.5 Known divergences to document
+
+Maintain `DIVERGENCES.md`:
+
+1. `cmd.exe` 8,191-char inherited environment discard rule does not apply to CmdX2 children
+2. `cmd.exe` 4,095-char GUI editor limit does not apply (registry writes bypass it)
+3. Environment block ceiling is 32,767 chars per variable, not total block
+4. `for /f` tokenization matches documented behavior; undocumented quirks not reproduced
+5. Builtins in pipelines: supported in all stages (cmd.exe only supports first stage)
+6. `%~s`, `%~a`, `%~t`, `%~z` modifiers: implemented; check parity
+7. `setlocal` scoping matches cmd.exe; depth limit 32
+8. `%ERRORLEVEL%` expansion matches cmd.exe except under `enabledelayedexpansion`
+9. `cmd /c` with no command exits 0
+10. `REG_EXPAND_SZ` expansion uses calling process environment; service-account launches may mis-expand user PATH
+11. `cmdx2 path add` refuses values above 32,767 chars; no silent truncation
+12. `ComSpec`-aware tools use CmdX2; tools hardcoding `System32\cmd.exe` bypass it (unless file replacement)
+13. `start` with `/wait` waits; without, returns immediately
+14. Pipeline stages after the first: builtins work in CmdX2, cmd.exe requires external
+15. Batch encoding: UTF-8 BOM, UTF-16 BOM, or ANSI; no other detection
+16. Pipeline stage limit 64 (WaitForMultipleObjects limit)
+
+### 6.6 Acceptance
+
+- All corpus tests pass with divergences limited to `DIVERGENCES.md`
+- All toolchain integration tests succeed
+- No memory or handle leaks in stress tests
+- Performance targets met
+- **Safety test still passes** (the regression guard from Milestone A)
+
+---
+
+## 7. Milestone G — Deployment (3–4 weeks, with risk)
+
+**Goal:** install CmdX2 such that `cmd.exe` invocations reach it.
+
+**Prerequisites:**
+- Milestone D (batch) complete
+- Milestone F acceptance met
+- Safety test passes
+- User has explicit rollback path
+
+**Risk framing:** replacing `cmd.exe` is a system-level operation. Windows components, installers, and recovery tools assume `cmd.exe` behaves as Microsoft's binary. Any deviation can:
+- Break Windows Update (which invokes `cmd.exe` for servicing)
+- Break system repair (`sfc /scannow`, `DISM`)
+- Break Windows Recovery Environment (WinRE) if it boots and uses the replaced binary
+- Break installers that shell out to `cmd.exe`
+- Be flagged by antivirus as tampering with a signed system file
+- Break Windows Setup if the user ever tries to upgrade/reinstall
+
+**Recommendation:** deploy in graduated levels. Level 1 is safe. Level 3 is not.
+
+### 7.1 Level 0 — Renamed side-by-side tool
+
+Installed at `C:\CmdX2\cmd.exe` (renamed copy of `cmdx2.exe`), not registered anywhere.
+
+Purpose: demonstrates the name works; allows tools to invoke it explicitly by full path.
+
+Deployment:
+```
+copy cmdx2.exe C:\CmdX2\cmd.exe
+```
+
+Risk: none. Reversal: delete `C:\CmdX2\cmd.exe`.
+
+### 7.2 Level 1 — COMSPEC redirect (recommended default)
+
+Set `COMSPEC` to `C:\CmdX2\cmd.exe`:
+
+```powershell
+# Per-user (no elevation)
+[Environment]::SetEnvironmentVariable('COMSPEC', 'C:\CmdX2\cmd.exe', 'User')
+
+# Machine-wide (elevation)
+[Environment]::SetEnvironmentVariable('COMSPEC', 'C:\CmdX2\cmd.exe', 'Machine')
+```
+
+Effect:
+- Tools that spawn `cmd.exe` via `%COMSPEC%` (npm, pip, cargo, cmake, most build systems) reach CmdX2.
+- Tools that hardcode `C:\Windows\System32\cmd.exe` bypass CmdX2.
+- Windows Update, DISM, `sfc`, WinRE still use the real `cmd.exe` — safe.
+
+Risk: minimal. Reversal: unset `COMSPEC` (or restore original value from `%APPDATA%\CmdX2\install-backup.json`).
+
+**This should be the default deployment mode** for most users. It solves the original problem (long PATH) for real toolchains without touching system files.
+
+### 7.3 Level 2 — PATH precedence (partial, adjunct)
+
+Place `C:\CmdX2` before `C:\Windows\System32` on `PATH`. Then `cmd` (without extension) resolves to `C:\CmdX2\cmd.exe`.
+
+Effect:
+- Bare `cmd` from a shell reaches CmdX2 (because `cmd.exe` in `C:\CmdX2\` matches first)
+- `C:\Windows\System32\cmd.exe` still reaches the real one
+- `cmd.exe` (with extension) also reaches CmdX2 if `C:\CmdX2` is first
+
+Risks:
+- Some tools run `cmd` (no extension) expecting System32's version but get CmdX2 — usually fine, but any bug in CmdX2 now affects those tools
+- Requires `C:\CmdX2` to be trusted (correct permissions on the directory)
+
+Reversal: remove `C:\CmdX2` from PATH.
+
+Combine with Level 1: `COMSPEC` catches tools that use it; PATH catches bare `cmd`.
+
+### 7.4 Level 3 — File replacement in System32 (dangerous, documented)
+
+Replace `C:\Windows\System32\cmd.exe` with CmdX2.
+
+Required steps (elevated):
+
+```
+1. takeown /f C:\Windows\System32\cmd.exe
+2. icacls C:\Windows\System32\cmd.exe /grant Administrators:F
+3. ren C:\Windows\System32\cmd.exe cmd-ms.exe
+4. copy C:\CmdX2\cmdx2.exe C:\Windows\System32\cmd.exe
+5. Verify SHA-256 of new file matches known CmdX2 build
+6. Set COMSPEC to the same path (belt and braces)
+7. Copy the same binary to:
+   - C:\Windows\SysWOW64\cmd.exe (for 32-bit callers)
+   - C:\Windows\WinSxS\... (leave alone; System32 is a hardlink)
+8. Reboot to test
+```
+
+**What breaks if CmdX2 has a bug at this level:**
+- Windows Update may fail on the next patch Tuesday
+- `sfc /scannow` will report modified system files (expected but noisy)
+- `DISM /RestoreHealth` may fail
+- WinRE — if the system enters recovery, it may use the modified `cmd.exe`; a bug there could prevent recovery
+- Installers that assume specific `cmd.exe` behavior
+- Antivirus may quarantine the modified file
+
+**Mandatory safety measures if pursuing Level 3:**
+
+1. **Keep the original at `C:\Windows\System32\cmd-ms.exe`** (rename, do not delete) — allows recovery.
+2. **Provide `cmdx2 uninstall`** that reverses the whole operation atomically.
+3. **Provide `cmdx2 status`** that reports whether replacement is in effect.
+4. **Test in a VM first** — never in production. Boot, run Windows Update, run `sfc /scannow`, run a tool that spawns `cmd.exe`, reboot twice.
+5. **Keep a bootable USB** with the original `cmd.exe` available.
+6. **Document the exact reversal** prominently:
+   ```
+   takeown /f C:\Windows\System32\cmd.exe
+   icacls C:\Windows\System32\cmd.exe /grant Administrators:F
+   del C:\Windows\System32\cmd.exe
+   ren C:\Windows\System32\cmd-ms.exe cmd.exe
+   sfc /scannow   (to restore any other files touched)
+   ```
+7. **Auto-detect tampering** — on startup, CmdX2 checks if it was launched from `C:\Windows\System32\cmd.exe`. If so, prints a one-time warning banner: `CmdX2 is running as the system cmd.exe. Press Ctrl+C to abort, or any key to continue.` This gives the user a chance to notice if a tool invoked them unexpectedly.
+
+**Recommendation:** do not do Level 3 unless you have thoroughly tested Level 1 and 2 for at least a month and encountered no failures. Even then, consider whether the marginal benefit (catching tools that hardcode `System32\cmd.exe`) is worth the risk.
+
+### 7.5 Distribution packaging
+
+Provide three installation modes:
+
+**Portable:**
+- Unzip `cmdx2.zip` to any directory
+- Run `cmdx2.exe` from there
+- No system changes
+
+**Per-user install:**
+- Copy to `%LOCALAPPDATA%\CmdX2\`
+- Add to user PATH (append, not prepend)
+- Optionally set user `COMSPEC`
+- No elevation
+- Reversal: delete directory, unset COMSPEC
+
+**Machine install:**
+- Copy to `C:\Program Files\CmdX2\` or `C:\CmdX2\`
+- Add to machine PATH (append, not prepend)
+- Optionally set machine `COMSPEC`
+- Optionally offer Level 3 file replacement with prominent warnings
+- Elevation required
+- Reversal: `cmdx2 uninstall` (registry-clean)
+
+### 7.6 Installer behavior
+
+`cmdx2 install.exe` (a separate small program, or a `cmdx2 install` subcommand):
+
+1. Detects architecture (x64 or ARM64)
+2. Verifies elevation level
+3. Offers the three deployment levels interactively:
+   - Level 1 (COMSPEC) — recommended
+   - Level 2 (PATH) — optional
+   - Level 3 (file replacement) — dangerous, requires typing "I UNDERSTAND THE RISK"
+4. Makes a full backup of the current state to `%APPDATA%\CmdX2\install-backup-<timestamp>\`:
+   - `before-path-machine.reg`
+   - `before-path-user.reg`
+   - `before-comspec.txt`
+   - `before-cmd.exe` (copy of the original binary, if Level 3)
+5. Performs the selected deployment
+6. Verifies success (launches a test child, checks `echo %PATH%`)
+7. On failure, automatically rolls back
+8. Writes `%APPDATA%\CmdX2\install-state.json` recording what was changed
+
+`cmdx2 uninstall`:
+1. Reads `install-state.json`
+2. Reverses every change in reverse order
+3. Verifies reversal (launches the original `cmd.exe` and checks it works)
+4. Removes `install-state.json`
+5. Does not delete the `%APPDATA%\CmdX2\` config unless `--purge` is passed
+
+`cmdx2 status`:
+- Reports deployment level currently in effect
+- Reports `COMSPEC` value (system and user)
+- Reports whether `C:\Windows\System32\cmd.exe` is CmdX2 or original
+- Reports whether `C:\CmdX2` is on PATH
+
+### 7.7 Anti-footgun measures
+
+Even if the user selects Level 3:
+- The warning banner on startup names the running binary (`C:\Windows\System32\cmd.exe`) so any tool that spawns it produces a visible message
+- The `install-state.json` file is written before any change, so an interrupted install can be recovered from `cmdx2 uninstall`
+- The original `cmd.exe` is preserved at `cmd-ms.exe`; a corrupted install can be fixed by renaming it back
+- An "emergency restore" `.bat` file is written to the desktop explaining the exact reversal steps (in case `cmdx2 uninstall` cannot run because CmdX2 itself is broken)
+
+### 7.8 Acceptance for deployment
+
+| Level | Test | Pass criteria |
+| :--- | :--- | :--- |
+| Level 1 | Run `npm install` in a scratch project | Succeeds; PATH is full |
+| Level 1 | Run `cmdx2 status` | Reports COMSPEC set, Level 1 active |
+| Level 1 | `cmdx2 uninstall` | COMSPEC restored; `npm` still works |
+| Level 2 | Type `cmd` in a fresh prompt | Reaches CmdX2; `ver` reports CmdX2 |
+| Level 2 | Type `cmd.exe /c echo %PATH%` | Reaches CmdX2; PATH is full |
+| Level 3 | Type `cmd` in a fresh prompt | Reaches CmdX2 |
+| Level 3 | `systeminfo` from CmdX2 | Succeeds (spawns original via COMPLUS) |
+| Level 3 | Windows Update check | Succeeds (uses `cmd-ms.exe` via System32 if needed) |
+| Level 3 | `sfc /scannow` | Reports modified files but does not fail the system |
+| Level 3 | Reboot twice | System boots normally |
+| Level 3 | `cmdx2 uninstall` | Original `cmd.exe` restored; system functional |
+| All | Boot into WinRE and run `cmd` | WinRE gets the original (Level 3 must not have replaced WinRE's copy) |
+
+---
+
+## 8. Testing Strategy — Continuous
+
+At every milestone, the following tests run:
+
+### 8.1 Unit tests (`TestCmdX2.dpr`)
+- Extended with one test per new feature
+- Target: > 200 tests by Milestone F
+- All pass before any commit that touches the corresponding unit
+
+### 8.2 Safety test (`test-path-file-safety.bat`)
+- **Never breaks**. If it fails, the launcher path is broken — stop and fix immediately.
+- Extended when new launch modes are added (`--path-file`, then `--path-env`, then registry, then batch)
+
+### 8.3 Corpus regression (`run_corpus.ps1`)
+- Grows with each milestone
+- Diff against `cmd.exe` with `--no-color`, fixed locale, fixed date format
+- Divergences documented in `DIVERGENCES.md`
+
+### 8.4 Real toolchain integration (`run-toolchains.ps1`)
+- 10+ toolchains, run end-to-end
+- Verify build output, artifacts, exit codes
+- Run in CI on Windows Server 2022 and Windows 11
+
+### 8.5 Stress tests (`run-stress.ps1`)
+- 10,000-command sequential execution
+- 1,000 sequential pipeline launches
+- 32,767-char PATH and 32,768-char PATH (error boundary)
+- 10,000-entry PATH resolution benchmark
+- Handle leak check (compare handle count before/after)
+
+### 8.6 Fuzz tests
+- Randomly mutate 1,000 batch files from the corpus
+- Verify CmdX2 does not crash on malformed input
+- Verify error messages are sensible
+
+---
+
+## 9. Timeline Summary
+
+| Milestone | Effort | Deliverable |
+| :--- | :--- | :--- |
+| **B** — Execution engine | 3–4 weeks | Pipes, redirection, operators, Ctrl+C, `cmdx2 path` CLI |
+| **C** — Builtins | 2–3 weeks | Full builtin set, `dir`, `start` |
+| **D** — Batch interpreter | 4–6 weeks | `.bat`/`.cmd` support, `goto`, `call`, `if`, `for` |
+| **E** — Shell UX | 3–4 weeks | Line editing, history, tab completion, prompt |
+| **F** — Compatibility | 4–6 weeks | Corpus passes, toolchains work, perf and robustness |
+| **G** — Deployment | 3–4 weeks | Installer, uninstaller, Level 1–3 |
+
+**Total from Milestone A to capable shell (B–F): 16–23 weeks.**
+**Total to deployable replacement (including G): 19–27 weeks.**
+
+Realistic; depends on the quality of the design and the availability of test cases. Every week underestimates the compatibility work (the corpus will reveal edge cases that add days each).
+
+---
+
+## 10. Risks
+
+| Risk | Mitigation |
+| :--- | :--- |
+| **CmdX2 breaks Windows Update at Level 3** | Strongly recommend Level 1 only. Level 3 requires explicit confirmation and rollback file on desktop. |
+| **Corpus finds unfixable quirks** | Document as divergences. Do not chase undocumented behavior. |
+| **Batch interpreter has subtle scoping bugs** | Extensive setlocal/delayedexpansion tests. Compare against cmd.exe in CI. |
+| **Console line editor feels laggy** | Benchmark, optimize the input loop. Fallback: use plain `Readln` if `--no-line-edit` flag passed. |
+| **A child process hangs due to CmdX2 bug** | Ctrl+C handler that kills the child. Timeout option in the launch code. |
+| **Antivirus flags modified `cmd.exe`** | Level 3 only. Document. Provide SHA-256. Accept the risk. |
+| **Windows overwrites System32\cmd.exe on update** | Level 3 is not permanent; reinstall after major updates. Document. |
+| **Residual TOCTOU in batch and deployment** | Documented. Inherent to any installer. |
+
+---
+
+## 11. The Deployment Question, Honestly
+
+**The user's stated goal:** "eventually even renamed to cmd.exe somehow."
+
+**The engineering reality:**
+
+1. **Level 1 (COMSPEC)** solves the original problem — long PATH works for tools that spawn `cmd.exe` — without touching system files. It is:
+   - Safe
+   - Reversible
+   - Sufficient for 95% of real-world toolchains
+   - **Recommended as the default deployment**
+
+2. **Level 2 (PATH)** catches bare `cmd` invocations but not `cmd.exe` with full path. Marginal extra coverage.
+
+3. **Level 3 (file replacement)** catches everything but is:
+   - Systemically risky
+   - Reversible only with careful tooling
+   - Likely to break on Windows updates
+   - Not how Microsoft intends `cmd.exe` to be replaced
+   - **Only recommended on machines you can reimage**
+
+**The plan supports all three levels.** The installer offers them in order of increasing risk. The default is Level 1. Level 3 requires an explicit "I understand" confirmation.
+
+**The honest recommendation:** implement Level 1 first. Live with it for a month. If no failures occur in normal use, and if a specific tool is broken by hardcoding `System32\cmd.exe`, consider Level 3 on a specific machine, with a full backup.
+
+Do not skip Levels B–F. A half-finished shell installed at Level 3 will break Windows. The shell must work — with real toolchains, real batch files, real pipes — before any deployment is considered.
+
+---
+
+## 12. Summary
+
+To go from Milestone A (working launcher, proven long-PATH delivery) to a deployable `cmd.exe` replacement:
+
+1. **B** — Make the execution engine real (pipes, redirection, operators, streams)
+2. **C** — Implement every builtin
+3. **D** — Implement the batch interpreter (the hard prerequisite for deployment)
+4. **E** — Make it pleasant to use (line editing, history, completion)
+5. **F** — Prove it works in the real world (corpus, toolchains, stress)
+6. **G** — Deploy, starting with COMSPEC, ending with file replacement only if justified and tested
+
+The order is not negotiable. Deployment before completion is dangerous. A complete shell that isn't deployed solves the original problem — it can be called as `cmdx2.exe` from any context where long PATH matters. Deployment multiplies the benefit but also multiplies the risk.
+
+The current state (Milestone A) solves the original problem for tools that call `cmdx2` explicitly. Milestone B makes it a shell. Milestone D makes it a `cmd.exe` replacement in every meaningful sense. Milestone G installs it that way.
