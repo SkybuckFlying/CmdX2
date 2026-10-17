@@ -1,0 +1,476 @@
+# `--path-file` — PATH Override from a File
+
+**Document scope:** `cmdx2.dpr`
+**Feature:** `--path-file <file>` command-line flag
+**Status:** Available from Milestone A onward
+**Related:** [`CmdX2Registry.pas`](CmdX2Registry.pas), [`CmdX2Path.pas`](CmdX2Path.pas), Plan v5 §6.3
+
+---
+
+## 1. What it does
+
+`--path-file` tells `cmdx2.exe` to load its PATH from a plain text file instead of from the Windows registry. When the flag is present, `cmdx2.exe` does not read `HKLM\...\Environment\Path`, does not read `HKCU\Environment\Path`, and does not expand any `%VAR%` references in a registry value. It reads the specified file, joins its lines into a single semicolon-delimited string, and uses that string as the PATH for the current invocation.
+
+The registry is not read. The registry is not written. The system is not touched.
+
+```
+cmdx2.exe --path-file <path-to-file> [other-args]
+```
+
+---
+
+## 2. Why this exists
+
+### 2.1 The original problem
+
+The Windows PATH mechanism is broken at four different limits, stacked on top of each other:
+
+| Limit | Where | Consequence |
+| :--- | :--- | :--- |
+| 2,047 chars | Environment Variables GUI | Cannot edit beyond |
+| 4,095 chars | Registry value after truncation on save | Silent corruption |
+| 8,191 chars | `cmd.exe` inherited environment | PATH discarded entirely |
+| 32,767 chars | Win32 individual environment variable | Hard API ceiling |
+
+CmdX2's Milestone A solves the problem by reading the registry directly and passing the full value to children via `CreateProcessW`. But to *prove* that the solution works at 20,000 characters, the registry must contain a 20,000-character PATH. On a working system, forcing that is invasive.
+
+### 2.2 The proof problem
+
+Two wrong approaches:
+
+1. **Modify the registry temporarily.** Requires backup, restore, and confidence that the restore succeeds. If the backup or restore fails, the system is left in a broken state. Unacceptable for a test.
+2. **Modify the process environment.** Does not work — `cmd.exe` discards PATH above 8,191 characters, so a batch file cannot construct a 20,000-character test case before `cmdx2.exe` starts.
+
+Neither is acceptable. The first is risky; the second is impossible.
+
+### 2.3 The solution
+
+`--path-file` decouples "where the PATH comes from" from "how the PATH is used." The mechanism — building a Unicode environment block, calling `CreateProcessW` with `CREATE_UNICODE_ENVIRONMENT`, passing the full value to the child — is independent of the source. If it works for a PATH read from a file, it works for a PATH read from the registry. The only variable is the source.
+
+This makes the Milestone A proof a *file* test instead of a *registry* test. Zero system modification. Zero recovery risk. Reproducible from a fresh checkout.
+
+### 2.4 The broader principle
+
+The registry PATH is broken. A file-based PATH is not broken. It has no character limit except disk space. It is easy to edit, easy to back up, easy to version-control, and easy to inspect with `diff`.
+
+`--path-file` is the smallest possible version of "CmdX2 can use a file-based PATH." It is a per-invocation override for testing and diagnostics. Later milestones can extend it to a persistent override (`%APPDATA%\CmdX2\PATH.txt`) if the user finds it useful. The flag is the seed.
+
+---
+
+## 3. File format
+
+### 3.1 Structure
+
+Plain text. One PATH entry per line. Blank lines are ignored. Each line is trimmed of leading and trailing whitespace.
+
+```
+C:\Tools\Python312
+C:\Tools\Python312\Scripts
+C:\Tools\Git\cmd
+C:\Tools\Rust\bin
+G:\Development\Delphi13\Bin
+```
+
+The entries are joined with `;` to form the PATH string. A trailing backslash is preserved verbatim (normalization is not performed; that is deliberate — see §7.3).
+
+### 3.2 Encoding
+
+The file is read as **UTF-8**. A BOM is not required and, if present, is treated as part of the first line (which would corrupt the first entry). Write the file without a BOM.
+
+If a non-ASCII character appears in an entry, ensure the file is saved as UTF-8. On Windows, Notepad defaults to UTF-8 for new files in Windows 11; for older versions, use "Save As" → "UTF-8".
+
+### 3.3 Limits
+
+The joined PATH string must not exceed `CMDX2_ENV_VAR_LIMIT_CHARS` (32,767 characters). If it does, `cmdx2.exe` prints an error and exits with code `9001`. It does not truncate. It does not proceed with a partial PATH.
+
+An empty file, or a file containing only blank lines, produces an empty PATH. This is legal — it will cause command resolution to fail for everything not in the current directory, but `cmdx2.exe` will not refuse to start.
+
+### 3.4 What the file is not
+
+- **Not a config file.** It contains only PATH entries. No sections, no keys, no syntax. It is a list.
+- **Not expanded.** `%SystemRoot%` and other `%VAR%` references are not substituted. Each line is used literally. If you want `%SystemRoot%\System32` on the PATH, write the expanded form (`C:\Windows\System32`) or accept that the child will see the literal `%SystemRoot%\System32` (which some programs will handle and others will not).
+- **Not merged with the registry.** When `--path-file` is present, the registry is not consulted. The file's contents *are* the PATH for that invocation.
+
+---
+
+## 4. Precedence
+
+`cmdx2.exe` determines its PATH at startup by evaluating these sources in order. The first one that applies wins; the others are not consulted.
+
+| Order | Source | Condition |
+| :--- | :--- | :--- |
+| 1 | `--path-file <file>` | Flag present on the command line |
+| 2 | Inherited `PATH` | `CMDX2_SESSION=1` **and** inherited `PATH` is non-empty |
+| 3 | Inherited `PATH` | `CMDX2_INHERIT_PATH=1` **and** inherited `PATH` is non-empty |
+| 4 | Registry merge | Default (no flag, no session marker) |
+
+The precedence is deliberate:
+
+- **`--path-file` wins over everything.** It is an explicit per-invocation instruction. If you say "use this file," `cmdx2.exe` uses that file, regardless of any session marker or inherited environment.
+- **`CMDX2_SESSION` preserves nested shells.** When `cmdx2.exe` launches a child that is also `cmdx2.exe`, the parent sets `CMDX2_SESSION=1`. The child sees the marker and trusts its inherited PATH, so a `set PATH=...` in the parent does not get overwritten by a registry re-read in the child.
+- **`CMDX2_INHERIT_PATH` is opt-in for activated environments.** Python virtualenvs, conda, and Developer Command Prompts modify the inherited PATH. If the user sets `CMDX2_INHERIT_PATH=1`, `cmdx2.exe` preserves the inherited PATH rather than replacing it with the registry value.
+- **Registry merge is the default.** Machine PATH first, user PATH second, deduplicated case-insensitively, first occurrence wins.
+
+### 4.1 Interaction with the session marker
+
+When `--path-file` is used, `cmdx2.exe` still sets `CMDX2_SESSION=1` in the environment it passes to children. This means:
+
+- Any child `cmdx2.exe` inherits `CMDX2_SESSION=1` and the file-derived PATH.
+- The child does **not** re-read the registry, because the session marker takes precedence over the default.
+- The child sees the same PATH as the parent.
+
+This is deliberate. A test that starts with `--path-file` should propagate consistently through nested shells.
+
+---
+
+## 5. Examples
+
+### 5.1 The Milestone A proof — zero registry risk
+
+```cmd
+mkdir C:\Temp\cmdx2-test
+cd C:\Temp\cmdx2-test
+
+REM Build a 1,400-entry synthetic PATH, one per line
+(for /L %i in (1,1,1400) do @echo C:\Fake\Tool%i) > testpath.txt
+
+REM Confirm the file exists and is non-empty
+dir testpath.txt
+
+REM Run the proof — reads the file, never touches the registry
+K:\Delphi\Applications\CMDX2\cmdx2.exe --path-file testpath.txt /c K:\Delphi\Applications\CMDX2\cmdx2_pathtest.exe
+
+REM Expected output: a number close to 21,000
+
+cd C:\
+rmdir /s /q C:\Temp\cmdx2-test
+```
+
+The child receives the full 21,000-character PATH via `CreateProcessW` with `CREATE_UNICODE_ENVIRONMENT`. The registry was not read, not written, not consulted.
+
+### 5.2 Reproducible bug report
+
+A user reports "tool X is not found." You ask them to run:
+
+```cmd
+cmdx2 path list > my-path.txt
+```
+
+They send you `my-path.txt`. You run:
+
+```cmd
+cmdx2 --path-file my-path.txt /c where.exe X
+```
+
+You now reproduce their exact resolution behavior on your machine. No environment matching required.
+
+### 5.3 Per-invocation override
+
+You have a tool that misbehaves with your normal PATH. You want to run it with a minimal PATH:
+
+```cmd
+echo C:\Windows\System32>C:\Temp\minimal.txt
+echo C:\Windows>>C:\Temp\minimal.txt
+cmdx2 --path-file C:\Temp\minimal.txt /c mytool.exe
+```
+
+The tool runs with exactly two directories on PATH. The registry is not consulted, not modified, and not affected.
+
+### 5.4 CI environments
+
+In a CI script, the registry is not necessarily in a known state. Rather than fight it:
+
+```yaml
+- name: Run tests
+  run: cmdx2 --path-file ci-path.txt /c build.cmd
+```
+
+Where `ci-path.txt` is checked into the repository. The build sees exactly the PATH the repository declares, regardless of what the CI runner has installed.
+
+### 5.5 What-if scenarios
+
+"What would resolution do if `C:\Ghost` were on PATH?"
+
+```cmd
+echo C:\Ghost>what-if.txt
+echo C:\Windows\System32>>what-if.txt
+cmdx2 --path-file what-if.txt /c where.exe ghost
+```
+
+Resolution runs against the hypothetical PATH. No registry change. No persistent effect.
+
+### 5.6 Interactive mode with a file PATH
+
+```cmd
+cmdx2 --path-file G:\Dev\path.txt
+```
+
+```
+CmdX2 [Milestone A]
+PATH source: file (G:\Dev\path.txt)
+PATH length (in-memory): 21100 chars
+Try:  cmdx2 --path-file test.txt /c cmdx2_pathtest.exe
+Type "exit" to quit.
+
+K:\Delphi\Applications\CMDX2> where.exe python
+C:\Tools\Python312\python.exe
+
+K:\Delphi\Applications\CMDX2> exit
+```
+
+The interactive shell runs entirely against the file's PATH. `set` and `path` builtins modify the in-memory PATH, but the file on disk is not written back. When the shell exits, the file is unchanged.
+
+---
+
+## 6. What `--path-file` does not do
+
+### 6.1 It does not write to the file
+
+The `set` and `path` builtins modify `ASession.Environment['PATH']` in memory. That change is visible to commands launched from the current shell. It is discarded when the shell exits. The `--path-file` file is read once at startup and never written.
+
+If you want to persist a session's PATH to the file, that will require a future `cmdx2 path save` command (not yet implemented). The current build has no mechanism to write the file.
+
+### 6.2 It does not expand environment variables
+
+`%SystemRoot%\System32` in the file is used literally. The child sees the literal string. If you want the child to see the expanded form, write the expanded form in the file.
+
+This is a deliberate design choice. The alternative — expanding `%VAR%` in the file using the parent process's environment — would introduce a hidden dependency on the parent's environment, which defeats the purpose of a self-contained test file.
+
+### 6.3 It does not affect the registry
+
+The file is read and used. Nothing about the registry is touched. `WriteUserPath` is not called. `BroadcastEnvironmentChange` is not called. No system-wide state changes.
+
+### 6.4 It does not affect other processes
+
+The file PATH is loaded into `cmdx2.exe`'s own `ASession.Environment` and passed to children. Processes launched outside `cmdx2.exe` — including processes launched by those children that use `COMSPEC` — receive whatever PATH `cmdx2.exe` chose to pass. But processes launched independently of `cmdx2.exe` (from Explorer, from another shell, from the Run dialog) are unaffected. They still see the registry PATH.
+
+This is by design. `--path-file` is a per-invocation override, not a system-wide change.
+
+### 6.5 It does not merge with the registry
+
+When `--path-file` is present, the registry is not consulted at all. The file's contents *are* the PATH. If you want the registry contents plus additional entries, export the registry PATH to a file first:
+
+```cmd
+cmdx2 path list > my-path.txt
+echo C:\Extra\Dir>> my-path.txt
+cmdx2 --path-file my-path.txt /c mytool.exe
+```
+
+### 6.6 It does not fall back to the registry on read failure
+
+If the file cannot be read (missing, permission denied, malformed), `cmdx2.exe` prints an error and exits with code `9001`. It does not silently fall back to the registry. Explicit is better than implicit.
+
+---
+
+## 7. Design rationale
+
+### 7.1 Why a file and not a registry value
+
+The registry has three problems:
+
+1. **Size limits** — the GUI truncates at 2,047, the stored value at 4,095, the inherited value at 8,191, the Win32 ceiling at 32,767. A file has none of these (except the 32,767 limit for the PATH *string itself*, which is a `CreateProcessW` limit, not a file limit).
+2. **Opaqueness** — the registry is binary and requires tools to inspect. A file can be opened in any editor, diffed with `diff`, version-controlled with `git`, and shared as an attachment.
+3. **Coupling** — writing to the registry affects the entire user account. A file affects only invocations that explicitly reference it.
+
+A file is the correct shape for a test fixture, a CI configuration, a reproducible bug report, and a what-if scenario. The registry is the correct shape for system-wide state. The two are different concerns and should use different mechanisms.
+
+### 7.2 Why one entry per line and not semicolon-delimited
+
+PATH is semicolon-delimited because the environment variable format is semicolon-delimited. A file does not have that constraint. One entry per line is:
+
+- Easier to diff (each change is one line).
+- Easier to edit (no wrapping, no ambiguity about spaces near semicolons).
+- Easier to comment out (add a blank line in the middle; the entry disappears from PATH).
+- Easier to sort (sort by line).
+
+The semicolon form can always be recovered with `join` or `paste -sd ';'`.
+
+### 7.3 Why no normalization
+
+`RebuildPathEntries` does not normalize trailing backslashes, duplicate entries, or case. It preserves the file's content as-is. This is deliberate:
+
+- A test fixture should be reproducible. If normalization changes the content, the fixture no longer tests what it was written to test.
+- `C:\Foo` and `C:\Foo\` are semantically distinct on Windows in some contexts (e.g., `CreateProcessW` with a working directory). Preserving the difference is correct.
+- The user who wants normalization can write the file in normalized form. Silent normalization hides user intent.
+
+Duplicate entries are also preserved. If the file contains `C:\Windows` on two lines, the joined PATH contains `C:\Windows;C:\Windows`. This is legal and matches what `cmd.exe` would do with a hand-typed `set PATH=...`.
+
+### 7.4 Why the flag is `--path-file` and not `/path-file` or `-p`
+
+Windows command-line conventions mix `/flag` and `--flag`. `cmdx2.exe` accepts `/c`, `/k`, and `--config` in the same command line, so both conventions are in use. The choice of `--path-file`:
+
+- Is unambiguous (two dashes distinguishes it from a path argument beginning with `/`).
+- Is self-documenting (`--path-file` names what it does).
+- Is unlikely to collide with a `cmd.exe` builtin or a Windows tool's flag.
+
+The `-p` short form is not provided because command-line parsing is intentionally minimal. `cmdx2.exe` accepts exactly the flags it documents, and nothing more.
+
+### 7.5 Why the flag is honored before the session marker
+
+The precedence order in §4 places `--path-file` above `CMDX2_SESSION`. This is intentional:
+
+- The user who types `cmdx2 --path-file X /c ...` is explicitly saying "use file X." Honoring the session marker first would override their explicit instruction.
+- The session marker exists to preserve `set PATH=...` across nested shells. It is a default, not an override. An explicit flag overrides a default.
+
+If the user wants to combine `--path-file` with a session marker, they can do so — the file's PATH is loaded and the marker is set on the child environment. The child `cmdx2.exe` sees the marker and inherits the file PATH rather than re-reading the registry. This is the correct nested behavior, and it works because `--path-file` sets the PATH before the marker is added to the environment.
+
+---
+
+## 8. Diagnostic output
+
+`cmdx2.exe` prints a one-line PATH source indicator at startup so the user can tell which source was used:
+
+| Scenario | Output |
+| :--- | :--- |
+| `--path-file` | `PATH source: file (C:\Temp\test.txt)` then `PATH loaded from file (21100 chars)` |
+| Session marker | `PATH source: inherited (session)` |
+| `CMDX2_INHERIT_PATH` | `PATH source: inherited (CMDX2_INHERIT_PATH)` |
+| Registry | `PATH source: registry (merged)` |
+
+If the file cannot be loaded, the error is printed before any other output:
+
+```
+Path file not found: C:\Temp\missing.txt
+```
+
+and the process exits with code `9001`.
+
+---
+
+## 9. Limitations and known constraints
+
+### 9.1 UTF-8 only
+
+The file is read as UTF-8. A file saved in the system code page (e.g., Windows-1252) may produce incorrect characters for paths containing non-ASCII. Save as UTF-8.
+
+### 9.2 No `%VAR%` expansion
+
+See §6.2. Write expanded paths in the file.
+
+### 9.3 32,767-character ceiling
+
+The joined PATH string is limited to 32,767 characters by the Win32 per-variable limit. The file itself can be larger, but the joined PATH must fit. A file with 10,000 entries of 50 characters each would join to 500,000 characters and be rejected.
+
+### 9.4 No persistence
+
+The file is read once per invocation. `set PATH=...` and `path X;Y` inside the shell modify the in-memory PATH but do not write the file. Session changes are lost when the shell exits.
+
+### 9.5 No merge with the registry
+
+When `--path-file` is present, the registry is not consulted. See §6.5 for the workaround.
+
+### 9.6 Windows-only
+
+`--path-file` is meaningful on Windows, where the registry is the default source. On non-Windows platforms (if the code is ported), the flag has no registry to override, and the default source is whatever the platform provides. The flag is still available but does nothing useful.
+
+---
+
+## 10. Future direction
+
+`--path-file` is the per-invocation form of a broader design: CmdX2 can use a file-based PATH as a persistent override.
+
+### 10.1 Persistent file override (planned)
+
+```
+Priority for CmdX2 PATH resolution:
+  1. --path-file (command line, per-invocation)
+  2. %APPDATA%\CmdX2\PATH.txt (persistent user override, if present)
+  3. Registry machine + user PATH (default)
+```
+
+When `%APPDATA%\CmdX2\PATH.txt` exists, `cmdx2.exe` uses it in place of the registry. The user who finds the registry mechanism broken can maintain their PATH entirely in a file and never touch the registry.
+
+### 10.2 `cmdx2 path save` (planned)
+
+```
+cmdx2 path save [--file <path>]
+```
+
+Writes the current in-memory PATH to the specified file, one entry per line. Combined with `cmdx2 path add`, this makes the file the single source of truth without any registry interaction.
+
+### 10.3 `cmdx2 path edit` (planned)
+
+Opens the file in `%EDITOR%` or Notepad. The user edits it, saves, and the next `cmdx2.exe` invocation reads the new content. This is the direct replacement for the broken Environment Variables GUI.
+
+### 10.4 `cmdx2 path check --file` (planned)
+
+Validates the file without launching anything:
+
+```
+cmdx2 path check --file C:\Temp\test.txt
+```
+
+Reports: entry count, duplicate entries, non-existent directories, character length, headroom.
+
+These features do not exist yet. `--path-file` is the foundation they will build on.
+
+---
+
+## 11. Reference: what changes inside `cmdx2.dpr`
+
+The feature consists of three additions to the program file.
+
+### 11.1 `LoadPathFromFile`
+
+A function that reads the file, joins its non-blank lines with `;`, validates the length against `CMDX2_ENV_VAR_LIMIT_CHARS`, and returns the joined PATH string.
+
+```pascal
+function LoadPathFromFile(const AFileName: string;
+  out APath, AError: string): Boolean;
+```
+
+Returns `False` on any failure (file missing, read error, length exceeded) with `AError` populated.
+
+### 11.2 Modified `LoadStartupPath`
+
+The startup path selection now takes an `APathFile: string` parameter. The first branch checks for `--path-file` and loads from the file if present, before the session marker and registry branches.
+
+```pascal
+procedure LoadStartupPath(ASession: TSession; const APathFile: string);
+```
+
+The function's logic is a cascade of `if` blocks: file override, session marker, `CMDX2_INHERIT_PATH`, registry merge. The first branch that matches sets the PATH; the others are not reached.
+
+### 11.3 Command-line parsing in the main block
+
+The main program scans `ParamStr` for `--path-file` before calling `LoadStartupPath`. The value is passed through to the loader.
+
+```pascal
+PathFile := '';
+I := 1;
+while I <= ParamCount do
+begin
+  if SameText(ParamStr(I), '--path-file') then
+  begin
+    if I < ParamCount then
+    begin
+      PathFile := ParamStr(I + 1);
+      Inc(I);
+    end
+    else
+    begin
+      Writeln(ErrOutput, '--path-file requires a value');
+      Halt(1);
+    end;
+  end;
+  Inc(I);
+end;
+```
+
+No other unit is modified. No new unit is added. `CmdX2Registry`, `CmdX2Env`, `CmdX2Exec`, `CmdX2Parser`, `CmdX2Resolver`, `CmdX2Builtins`, and `CmdX2Diagnostics` are all unchanged.
+
+---
+
+## 12. Summary
+
+`--path-file` is a small, safe, useful feature with three properties that matter:
+
+1. **Safe by construction.** It cannot touch the registry. It cannot corrupt the environment. It cannot affect any process other than the ones it launches.
+2. **Useful beyond testing.** It makes CI runs reproducible, bug reports actionable, and per-invocation overrides trivial. These are real needs, not test scaffolding.
+3. **Foundation for a future direction.** It is the first step toward a file-based PATH that bypasses the broken registry mechanism entirely. When Milestone C adds `cmdx2 path save` and Milestone D adds `cmdx2 path edit`, the file becomes a first-class configuration mechanism — not a workaround.
+
+The Milestone A proof that started this — "does a 20,000-character PATH reach a native child?" — is now a zero-risk test that can be run, deleted, and repeated. That was the goal. The feature is the means.
+
+---
+
+**End of document.**

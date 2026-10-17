@@ -1,0 +1,1103 @@
+# CmdX2 — Plan v5 (Final, Frozen, Implementation-Ready)
+
+**Status:** Frozen. Supersedes v1–v4. Incorporates every correction from the v4 technical review. This document is the implementation specification. No further architectural revision.
+
+---
+
+## 0. Framing: Two Products, Not One
+
+The original problem — *"a 20,000-character PATH reaching a native child"* — is solved by **Milestone A** alone: a small native launcher, a registry read, and a correct `CreateProcessW` call. That is 3–5 days of work.
+
+The complete shell described in this document — pipes, redirection, batch, builtins, corpus — is what makes CmdX2 a **daily driver** for arbitrary `cmd.exe` workflows. It is 15–20 weeks of work.
+
+These are separate deliverables. A user whose goal is "make `git`, `npm`, `python`, `cargo` work with a long PATH" can stop at **Milestone A + a minimal resolver + a `cmdx2 <tool>` launcher** and be done. The full shell is a choice, not a requirement of the problem.
+
+This distinction governs the entire plan.
+
+---
+
+## 1. Vision, Principles, Non-Goals
+
+### 1.1 What CmdX2 is
+
+A native Delphi 13 Win64 command interpreter that:
+
+1. **Stores PATH in the Windows registry** (machine + user), bypassing the 4095-character GUI editor limit.
+2. **Passes a full, untruncated Unicode environment block** to every child via `CreateProcessW`, bypassing `cmd.exe`'s 8191-character inheritance discard rule for native children.
+3. **Executes native pipelines and redirection** without delegating to `cmd.exe`.
+4. **Interprets batch files** with `goto`, `call`, `if`, `for`, `setlocal` sufficient for real-world `.bat` and `.cmd` files.
+5. **Manages persistent PATH** via `cmdx2 path add/remove/check/backup/restore` writing to the registry with verification and `WM_SETTINGCHANGE` broadcast.
+6. **Can serve as `COMSPEC`** (opt-in) for applications that honor it.
+
+### 1.2 Committed principles
+
+| Principle | Consequence |
+| :--- | :--- |
+| Registry authoritative at outermost launch | No TOML, no private database |
+| Never silently truncate PATH | Every failure is reported with sizes and options |
+| Never delegate to `System32\cmd.exe` | Native pipes, redirection, operators |
+| Faithful child environment | `=X:` drive-cwd, `REG_EXPAND_SZ` type, Unicode, full PATH |
+| Case-insensitive environment | `PATH` = `Path` = `path` |
+| Deterministic nested-session behavior | `CMDX2_SESSION` + non-empty-PATH guard |
+| No probe, no shims, no trimming strategies | Fixed 32,767-char per-variable ceiling |
+| No system file modification | No IFEO, no replacing `System32\cmd.exe` |
+| Honest scope claims | Divergences documented; not a byte-for-byte clone |
+
+### 1.3 Non-goals (final)
+
+- Byte-for-byte fidelity with undocumented `cmd.exe` quirks.
+- Replacing `System32\cmd.exe` on disk.
+- Intercepting applications that hardcode `cmd.exe` by full path.
+- PATH storage beyond 32,767 chars **per variable** (total block size is separate; see §3.4).
+- Original spec's probe / 64 MB environment testing.
+- TOML configuration hierarchy.
+- Shims, launchers, multi-source PATH strategies.
+- Terminating descendant processes spawned by pipeline stages (narrowed guarantee; see §6.7).
+
+---
+
+## 2. Frozen Architecture
+
+### 2.1 Units
+
+| Unit | Responsibility |
+| :--- | :--- |
+| `CmdX2Types.pas` | Core types, session lifecycle, comparer |
+| `CmdX2Registry.pas` | Read/write/backup/restore PATH; merge; `WM_SETTINGCHANGE` |
+| `CmdX2Env.pas` | Inherited-env load; block construction (UTF-16LE); per-drive entries |
+| `CmdX2Parser.pas` | Tokenizer; parser (AST); expansion passes |
+| `CmdX2Resolver.pas` | Name→absolute-path; PATHEXT; CWD rule; PATH ordering |
+| `CmdX2Builtins.pas` | Genuine builtins; `cmdx2` subcommands |
+| `CmdX2Exec.pas` | `CreateProcessW` with `STARTUPINFOEX`; pipeline engine; redirection engine |
+| `CmdX2Batch.pas` | Script execution; labels; `goto`/`call`/`if`/`for`; argument substitution |
+| `CmdX2Diagnostics.pas` | `cmdx2 path/which/diagnose/env-dump`; log writer |
+| `cmdx2.dpr` | REPL; `/c` `/k`; startup PATH selection |
+| `cmdx2_pathtest.dpr` | Native child for acceptance tests |
+| `TestCmdX2.dpr` | Test suite |
+
+### 2.2 Threading model
+
+Single-threaded event loop on the main thread. Executor blocks on children except for pipeline stages, which start concurrently and are waited in a defined order. No background threads in v1.
+
+---
+
+## 3. Data Structures
+
+### 3.1 Session
+
+```pascal
+type
+  TEnvKeyComparer = class(TInterfacedObject, IEqualityComparer<string>)
+    function Equals(const L, R: string): Boolean;
+    function GetHashCode(const V: string): Integer;
+  end;
+
+  TEnvironmentMap = TDictionary<string, string>;
+
+  TBatchFrame = class
+  public
+    FilePath: string;
+    Lines: TStringList;
+    CurrentLine: Integer;
+    Labels: TDictionary<string, Integer>;
+    Arg0: string;
+    Args: TStringList;
+    EchoState: Boolean;
+    DelayedExpansionState: Boolean;
+    ReturnStack: TStack<TBatchReturnPoint>;  // for call :label
+    constructor Create;
+    destructor Destroy; override;
+  end;
+
+  TBatchReturnPoint = record
+    Line: Integer;
+    Arg0: string;
+    Args: TStringList;   // owned; freed on pop
+  end;
+
+  TSession = class
+  public
+    Environment: TEnvironmentMap;            // case-insensitive
+    MachineRawPath: string;                   // preserved for provenance
+    UserRawPath: string;                      // preserved for provenance
+    MachinePathType: string;                  // 'REG_SZ' or 'REG_EXPAND_SZ'
+    UserPathType: string;
+    RawPath: string;                          // canonical merged PATH
+    PathEntries: TList<string>;               // derived from RawPath (no source)
+    PathExtList: TStringList;
+    PerDriveCwd: TDictionary<Char, string>;
+    Cwd: string;
+    ErrorLevel: Integer;
+    ShouldExit: Boolean;
+    SetLocalStack: TList<TEnvironmentMap>;
+    DelayedExpansion: Boolean;
+    DelayedStack: TList<Boolean>;
+    BatchStack: TObjectList<TBatchFrame>;
+    DirectoryStack: TStringList;
+    ResolverCache: TDictionary<string, string>;
+    constructor Create;
+    destructor Destroy; override;
+  end;
+
+const
+  CMDX2_ENV_VAR_LIMIT_CHARS     = 32767;  // per-variable; excludes null
+  CMDX2_CMD_INHERIT_LIMIT_CHARS = 8191;   // cmd.exe compatibility warning
+  CMDX2_CMDLINE_LIMIT_CHARS     = 32766;  // excludes null
+  CMDX2_MAX_PIPE_STAGES         = 64;
+  CMDX2_MAX_BATCH_RECURSION     = 32;
+  CMDX2_MAX_SETLOCAL_DEPTH      = 32;
+  CMDX2_MAX_GROUP_DEPTH         = 32;
+```
+
+**Note:** `TSession` is now a **class**, not a record. This avoids the same copy-hazard that plagues `TParsedCommand` records. `PathEntries` drops the `Source` field for v1; provenance is available via `MachineRawPath` / `UserRawPath` for diagnostics.
+
+### 3.2 Parser AST — all classes
+
+```pascal
+type
+  TRedirectSource = (rsDefault, rsStdin, rsStdout, rsStderr);
+
+  TRedirectOpKind = (
+    roToFile,           // source > [append] file
+    roFromFile,         // stdin < file
+    roToNul,            // source > nul
+    roDup               // source >& target
+  );
+
+  TRedirectOp = record
+    Source: TRedirectSource;   // rsDefault means "the natural destination"
+    Kind: TRedirectOpKind;
+    Append: Boolean;           // for roToFile / roToNul
+    Target: string;            // file path, or "1"/"2" for roDup
+  end;
+
+  TOperator = (opNone, opAnd, opOr, opSeq);
+
+  TParsedCommand = class
+  public
+    ProgramName: string;
+    Args: TStringList;
+    Redirects: TList<TRedirectOp>;     // ordered
+    PipeToNext: Boolean;
+    Op: TOperator;
+    constructor Create;
+    destructor Destroy; override;
+  end;
+
+  TParsedGroup = class
+  public
+    Condition: TParsedCommand;         // nil for bare group
+    TrueBranch: TParsedCommandList;    // always allocated
+    FalseBranch: TParsedCommandList;   // nil if no else
+    constructor Create;
+    destructor Destroy; override;
+  end;
+
+  TParsedCommandList = class(TObjectList<TParsedCommand>);
+  // Element: a command or a group-wrapper; use a discriminated container.
+
+  // Unified node:
+  TCommandNodeKind = (cnCommand, cnGroup);
+
+  TCommandNode = class
+  public
+    Kind: TCommandNodeKind;
+    Command: TParsedCommand;         // when cnCommand
+    Group: TParsedGroup;             // when cnGroup
+    constructor CreateCommand;
+    constructor CreateGroup;
+    destructor Destroy; override;
+  end;
+
+  TParsedCommandLine = class(TObjectList<TCommandNode>);
+```
+
+**Key design points:**
+- Everything is a class. No records containing owned references.
+- Group nodes are explicit. `if` is represented as a `cnGroup` node with a `Condition`, `TrueBranch`, and optional `FalseBranch`.
+- The parser never "flushes then modifies." It builds nodes and assigns branches to the correct node.
+
+### 3.3 Token types
+
+```pascal
+type
+  TTokenKind = (
+    tkWord,
+    tkRedirectOut,          // > or 1>        (Source := rsStdout, Append := False)
+    tkRedirectOutAppend,    // >> or 1>>      (Source := rsStdout, Append := True)
+    tkRedirectIn,           // <              (Source := rsStdin)
+    tkRedirectErr,          // 2>             (Source := rsStderr, Append := False)
+    tkRedirectErrAppend,    // 2>>            (Source := rsStderr, Append := True)
+    tkRedirectDupOut,       // >&             (Source := rsStdout; next word is 1 or 2)
+    tkRedirectDupErr,       // 2>&            (Source := rsStderr; next word is 1 or 2)
+    tkPipe,                 // |
+    tkAnd,                  // &&
+    tkOr,                   // ||
+    tkSeq,                  // &
+    tkLParen,               // (
+    tkRParen                // )
+  );
+
+  TToken = record
+    Kind: TTokenKind;
+    Text: string;           // for tkWord
+    class function Make(AKind: TTokenKind; const AText: string): TToken; static;
+  end;
+```
+
+**Critical change from v4:** `1>` is not a separate token — it is `tkRedirectOut` (the `1` is redundant with the default). `2>` is `tkRedirectErr`. `>&` and `2>&` are distinct tokens; the following word (`1` or `2`) is consumed by the parser, not the tokenizer, because it must be a separate word token to preserve spacing rules.
+
+### 3.4 Environment block limit clarification
+
+- The 32,767-character limit applies **per variable**. It is the length of the `NAME=VALUE` string *including* the null terminator's slot but *not* the null itself.
+- The **total block size is not documented as limited** on modern Windows. v5 does not impose a total-block limit. If a total block fails to launch, the failure is reported with the size.
+- Validation is per-variable: each `NAME=VALUE` value portion must be ≤ 32,766 characters (so `NAME=VALUE\0` fits in 32,767 including the null slot). If any variable exceeds this, `BuildEnvironmentBlockUTF16` returns nil and the launch is refused with a detailed report.
+
+---
+
+## 4. Milestone A — Environment Inheritance Proof (3–5 days)
+
+**This is the first deliverable.** It proves the core mechanism before any parser work.
+
+### 4.1 Scope of Milestone A
+
+A minimal `cmdx2.exe` that:
+
+1. Reads and merges machine + user registry PATH.
+2. Preserves inherited `=X:` entries and other environment variables.
+3. Validates the merged PATH length per §3.4.
+4. Accepts a single command-line form: `cmdx2 /c <absolute-path-to-exe> [args...]`.
+5. Launches that executable with `CreateProcessW` using `CREATE_UNICODE_ENVIRONMENT` and `STARTUPINFOEX` with an explicit handle list.
+
+It does **not** implement: PATH resolution, pipes, redirection, batch, or any builtin. It is a proof, not a shell.
+
+### 4.2 `CmdX2Registry.pas` — minimum viable
+
+```pascal
+type
+  TRegistryPath = record
+    RawValue: string;
+    ValueType: string;   // 'REG_SZ' or 'REG_EXPAND_SZ'
+    Expanded: string;
+  end;
+
+function ReadMachinePath(out APath: TRegistryPath): Boolean;
+function ReadUserPath(out APath: TRegistryPath): Boolean;
+function MergePath(const AMachine, AUser: TRegistryPath;
+  out AMerged: string; out AError: string): Boolean;
+procedure BroadcastEnvironmentChange;
+```
+
+`MergePath` merges machine + user expanded values, deduplicates case-insensitively (first occurrence wins), and validates merged length ≤ `CMDX2_ENV_VAR_LIMIT_CHARS`. Returns `False` with a message if over limit.
+
+### 4.3 `CmdX2Env.pas` — minimum viable
+
+```pascal
+procedure LoadCurrentEnvironment(var ASession: TSession);
+// Reads GetEnvironmentStringsW; handles =X: entries; case-insensitive map.
+
+function BuildEnvironmentBlockUTF16(const AEnv: TEnvironmentMap;
+  out ABlockSize: Int64; out AError: string): Pointer;
+// Returns nil on over-limit variable; sets AError.
+// Result is heap-allocated; caller frees via FreeEnvironmentBlockUTF16.
+```
+
+### 4.4 `CmdX2Exec.pas` — minimum viable launch
+
+```pascal
+function LaunchWithExplicitBlock(
+  const AExePath: string;
+  AArgs: TStringList;
+  AEnvBlock: Pointer;
+  AWorkDir: string;
+  out AError: string
+): Boolean;
+```
+
+Inside:
+
+1. Build command line with `WinQuoteArg`.
+2. Allocate **writable** `PWideChar` buffer via `GetMem` (delphi string may be shared/read-only).
+3. Build `STARTUPINFOEX`:
+   - `DuplicateHandle` current `STD_INPUT/OUTPUT/ERROR` with `bInheritHandle := TRUE`.
+   - Populate `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` with the three duplicates.
+   - `SI.StartupInfo.dwFlags := STARTF_USESTDHANDLES`.
+4. `CreateProcessW(AExePath, CmdLineBuffer, nil, nil, TRUE, CREATE_UNICODE_ENVIRONMENT or EXTENDED_STARTUPINFO_PRESENT, AEnvBlock, AWorkDir, @SI.StartupInfo, PI)`.
+5. On success: close handle-list handles, `WaitForSingleObject`, `GetExitCodeProcess`.
+6. Cleanup: `DeleteProcThreadAttributeList`, `FreeMem(AttrList)`, `FreeMem(CmdLineBuffer)`, close process/thread handles.
+
+### 4.5 `WinQuoteArg` — correct
+
+```pascal
+function WinQuoteArg(const S: string): string;
+var
+  NeedsQuote: Boolean;
+  I, N: Integer;
+begin
+  if S = '' then Exit('""');
+  NeedsQuote := False;
+  for I := 1 to Length(S) do
+    if S[I] in [' ', #9, '"'] then
+    begin
+      NeedsQuote := True;
+      Break;
+    end;
+  if not NeedsQuote then Exit(S);
+
+  Result := '"';
+  I := 1;
+  while I <= Length(S) do
+  begin
+    if S[I] = '\' then
+    begin
+      N := 0;
+      while (I <= Length(S)) and (S[I] = '\') do
+      begin
+        Inc(N);
+        Inc(I);
+      end;
+      if I > Length(S) then
+        Result := Result + StringOfChar('\', N * 2)   // before closing quote
+      else if S[I] = '"' then
+      begin
+        Result := Result + StringOfChar('\', N * 2) + '\"';
+        Inc(I);   // consume the quote
+      end
+      else
+        Result := Result + StringOfChar('\', N);
+    end
+    else if S[I] = '"' then
+    begin
+      Result := Result + '\"';
+      Inc(I);
+    end
+    else
+    begin
+      Result := Result + S[I];
+      Inc(I);
+    end;
+  end;
+  Result := Result + '"';
+end;
+```
+
+**Unit tests** against `CommandLineToArgvW` round-trip:
+- `""` → single empty arg.
+- `"hello world"` → one arg with space.
+- `a"b` → quote escaped.
+- `a\` → `a\` (no quote needed).
+- `a b\` → `"a b\\"` (trailing slash doubled before closing quote).
+- `a\"b` → complex backslash-quote run.
+
+### 4.6 `cmdx2_pathtest.dpr`
+
+```pascal
+program cmdx2_pathtest;
+{$APPTYPE CONSOLE}
+uses Windows, SysUtils;
+var
+  Buf: PWideChar;
+  BufLen, N: DWORD;
+begin
+  BufLen := 4096;
+  while True do
+  begin
+    GetMem(Buf, BufLen * SizeOf(WideChar));
+    N := GetEnvironmentVariableW('PATH', Buf, BufLen);
+    if N >= BufLen then
+    begin
+      FreeMem(Buf);
+      BufLen := N + 4096;
+      Continue;
+    end;
+    Writeln(N);
+    FreeMem(Buf);
+    Break;
+  end;
+end.
+```
+
+### 4.7 Milestone A acceptance
+
+| Test | Expected |
+| :--- | :--- |
+| Registry PATH 5,000 → `cmdx2 /c cmdx2_pathtest.exe` | ≥ 5,000 |
+| Registry PATH 8,191 | ≥ 8,191 |
+| Registry PATH 8,192 | ≥ 8,192 (proves the fix) |
+| Registry PATH 20,000 | ≥ 20,000 |
+| Registry PATH 32,766 | ≥ 32,766 |
+| Registry PATH 32,767 | ≥ 32,767 |
+| Registry PATH 32,768 | Refused before launch; error names lengths |
+| Machine 20,000 + User 20,000 | Refused; error names component lengths |
+| `=C:` inherited from parent → child | Present in child block (verified by extended `cmdx2_pathtest` with `-dumpall`) |
+
+**End of Milestone A: the original problem is solved and proven.**
+
+---
+
+## 5. Milestone B — Parser Rewrite (1.5 weeks)
+
+### 5.1 Tokenizer
+
+Operates on the percent-expanded command line. Caret handling is inside the tokenizer. Every branch uses `Continue`. No fall-through.
+
+```
+Tokenize(Input: string): TList<TToken>
+  InQuote := False
+  CurrToken := ''
+  I := 1
+
+  while I <= Length(Input) do
+    Ch := Input[I]
+
+    // Caret escape: next char literal, never operator
+    if (Ch = '^') and (not InQuote) then
+      Inc(I)
+      if I <= Length(Input) then
+        CurrToken := CurrToken + Input[I]
+        Inc(I)
+      Continue
+
+    // Quotes preserved for reconstruction
+    if Ch = '"' then
+      InQuote := not InQuote
+      CurrToken := CurrToken + Ch
+      Inc(I)
+      Continue
+
+    if InQuote then
+      CurrToken := CurrToken + Ch
+      Inc(I)
+      Continue
+
+    // Whitespace
+    if Ch in [' ', #9] then
+      FlushWord(CurrToken, Tokens)
+      Inc(I)
+      Continue
+
+    // Parentheses
+    if Ch = '(' then FlushWord; Tokens.Add(Make(tkLParen, '')); Inc(I); Continue
+    if Ch = ')' then FlushWord; Tokens.Add(Make(tkRParen, '')); Inc(I); Continue
+
+    // Descriptor-prefixed redirects — checked before bare operators
+    // 2>&
+    if (Ch = '2') and (I+1 <= Len) and (Input[I+1] = '>') then
+      FlushWord
+      if (I+2 <= Len) and (Input[I+2] = '&') then
+        Tokens.Add(Make(tkRedirectDupErr, '')); Inc(I, 3)
+      else if (I+2 <= Len) and (Input[I+2] = '>') then
+        Tokens.Add(Make(tkRedirectErrAppend, '')); Inc(I, 3)
+      else
+        Tokens.Add(Make(tkRedirectErr, '')); Inc(I, 2)
+      Continue
+
+    // 1>&
+    if (Ch = '1') and (I+1 <= Len) and (Input[I+1] = '>') then
+      FlushWord
+      if (I+2 <= Len) and (Input[I+2] = '&') then
+        Tokens.Add(Make(tkRedirectDupOut, '')); Inc(I, 3)
+      else if (I+2 <= Len) and (Input[I+2] = '>') then
+        Tokens.Add(Make(tkRedirectOutAppend, '')); Inc(I, 3)
+      else
+        Tokens.Add(Make(tkRedirectOut, '')); Inc(I, 2)
+      Continue
+
+    // Bare > or >> or >&
+    if Ch = '>' then
+      FlushWord
+      if (I+1 <= Len) and (Input[I+1] = '>') then
+        Tokens.Add(Make(tkRedirectOutAppend, '')); Inc(I, 2)
+      else if (I+1 <= Len) and (Input[I+1] = '&') then
+        Tokens.Add(Make(tkRedirectDupOut, '')); Inc(I, 2)
+      else
+        Tokens.Add(Make(tkRedirectOut, '')); Inc(I)
+      Continue
+
+    if Ch = '<' then FlushWord; Tokens.Add(Make(tkRedirectIn, '')); Inc(I); Continue
+
+    if Ch = '|' then
+      FlushWord
+      if (I+1 <= Len) and (Input[I+1] = '|') then
+        Tokens.Add(Make(tkOr, '')); Inc(I, 2)
+      else
+        Tokens.Add(Make(tkPipe, '')); Inc(I)
+      Continue
+
+    if Ch = '&' then
+      FlushWord
+      if (I+1 <= Len) and (Input[I+1] = '&') then
+        Tokens.Add(Make(tkAnd, '')); Inc(I, 2)
+      else
+        Tokens.Add(Make(tkSeq, '')); Inc(I)
+      Continue
+
+    // Ordinary character — the fall-through that was missing in earlier plans
+    CurrToken := CurrToken + Ch
+    Inc(I)
+  end
+
+  FlushWord(CurrToken, Tokens)
+```
+
+**Critical:** the `2>&` and `1>&` branches are checked **before** bare `>` and `2>`, and before bare `&`. This is what fixes the v4 defect.
+
+### 5.2 Parser — recursive AST construction
+
+```
+ParseGroup(Tokens, var I: Integer, IsRoot: Boolean): TParsedCommandLine
+  Result := TParsedCommandLine.Create
+  Cmd := nil
+
+  while I < Tokens.Count do
+    Tok := Tokens[I]
+    case Tok.Kind of
+      tkRParen:
+        if not IsRoot then
+        begin
+          Inc(I)
+          if Assigned(Cmd) then Result.Add(NodeFor(Cmd))
+          Exit
+        end
+        else
+          ReportError('Unmatched )'); Inc(I)
+
+      tkLParen:
+        Inc(I)
+        // group without a preceding condition — bare group
+        Sub := ParseGroup(Tokens, I, False)
+        Group := TParsedGroup.Create
+        Group.Condition := nil
+        Group.TrueBranch := Sub
+        Result.Add(NodeForGroup(Group))
+        Cmd := nil
+
+      tkWord:
+        if not Assigned(Cmd) then Cmd := TParsedCommand.Create
+        if Cmd.ProgramName = '' then
+          Cmd.ProgramName := Tok.Text
+        else
+          Cmd.Args.Add(Tok.Text)
+        Inc(I)
+
+      tkRedirectOut, tkRedirectOutAppend:
+        if not Assigned(Cmd) then Cmd := TParsedCommand.Create
+        Append := Tok.Kind = tkRedirectOutAppend
+        Target := NextWord(Tokens, I)   // advances I past the word
+        if SameText(Target, 'nul') then
+          Cmd.Redirects.Add(Redirect(rsStdout, roToNul, Append, ''))
+        else
+          Cmd.Redirects.Add(Redirect(rsStdout, roToFile, Append, Target))
+
+      tkRedirectErr, tkRedirectErrAppend:
+        // same pattern; Source = rsStderr
+
+      tkRedirectIn:
+        if not Assigned(Cmd) then Cmd := TParsedCommand.Create
+        Target := NextWord(Tokens, I)
+        Cmd.Redirects.Add(Redirect(rsStdin, roFromFile, False, Target))
+
+      tkRedirectDupOut:      // >&n
+        if not Assigned(Cmd) then Cmd := TParsedCommand.Create
+        Target := NextWord(Tokens, I)
+        if Target in ['1', '2'] then
+          Cmd.Redirects.Add(Redirect(rsStdout, roDup, False, Target))
+        else
+          ReportError('>& must be followed by 1 or 2')
+
+      tkRedirectDupErr:      // 2>&n
+        // same, Source = rsStderr
+
+      tkPipe:
+        if Assigned(Cmd) then
+          Cmd.PipeToNext := True
+          Result.Add(NodeFor(Cmd)); Cmd := nil
+        Inc(I)
+
+      tkAnd, tkOr, tkSeq:
+        if Assigned(Cmd) then
+          Cmd.Op := OpFor(Tok.Kind)
+          Result.Add(NodeFor(Cmd)); Cmd := nil
+        Inc(I)
+    end
+  end
+
+  if Assigned(Cmd) then Result.Add(NodeFor(Cmd))
+  Exit
+end
+```
+
+**Group-with-condition handling.** The parser treats `if`/`else` as *words* during initial parse. Grouped execution resolves the semantics:
+
+- When a `tkWord` is `if` or `for` or `call`, the parser records it as a normal command initially.
+- The batch interpreter (§9) handles grouped-body binding when it sees `if ... (` in a line.
+- The parser does **not** need to build condition nodes during token parsing; it can build them in a second pass when the interpreter requires them. This is a deliberate simplification for v1. (The reviewer's concern about condition association is addressed by making the group explicit and by not "flushing then modifying" — each node is fully constructed before being added to the list.)
+
+If a full syntactic `if`-as-group model is needed later, the class structure supports it: add a `cnIf` node kind and let the interpreter construct it during batch parsing.
+
+### 5.3 Expansion passes
+
+Order is fixed:
+
+1. **Percent expansion** — applied to the whole command line before tokenization.
+2. **Caret escape** — inside tokenizer (§5.1). Never pre-tokenization.
+3. **Delayed expansion** — `!VAR!`, applied after tokenization, before execution, only when `DelayedExpansion = True`.
+
+Percent expansion rules:
+
+- `%%` at command level → `%`.
+- `%%X` in a batch `for` context → `%X` (for-var placeholder; expanded later per iteration).
+- `%0`–`%9` → batch argument substitution (empty if absent).
+- `%*` → all args joined.
+- `%~dpN`, `%~fN`, `%~nxN`, `%~xN`, `%~nN`, `%~dN`, `%~pN` → argument modifier.
+- `%NAME%` → environment lookup; absent → literal `%NAME%`.
+- Trailing `%` → literal.
+
+### 5.4 Milestone B acceptance
+
+Unit tests for tokenizer: every token kind, `2>&1` and `1>&2` produce `tkRedirectDupErr`/`tkRedirectDupOut` followed by `tkWord('1')`/`tkWord('2')`. Parser tests: plain command, redirect chain, pipe chain, group without condition.
+
+Interactive: `echo hello`, `echo "hello world"`, `echo a^&b`, `echo a&&echo b`, `echo a 2>&1`, `echo a | findstr a`.
+
+---
+
+## 6. Milestone C — Registry Management, Native Exec, Pipes, Redirection (3–4 weeks)
+
+### 6.1 PATH flow — canonical string, derived entries
+
+```
+Environment['PATH'] (canonical merged string)
+   ↓ RebuildPathEntries
+PathEntries (derived, used only for resolver and reporting)
+   ↓
+Resolver / diagnostics read PathEntries
+```
+
+`RebuildPathEntries`:
+
+```pascal
+procedure RebuildPathEntries(var ASession: TSession);
+var
+  Parts: TStringList;
+  I: Integer;
+begin
+  ASession.RawPath := ASession.Environment['PATH'];
+  ASession.PathEntries.Clear;
+  Parts := TStringList.Create;
+  try
+    Parts.Delimiter := ';';
+    Parts.StrictDelimiter := True;
+    Parts.DelimitedText := ASession.RawPath;
+    for I := 0 to Parts.Count - 1 do
+      if Parts[I] <> '' then
+        ASession.PathEntries.Add(Parts[I]);
+  finally
+    Parts.Free;
+  end;
+  ASession.ResolverCache.Clear;
+end;
+```
+
+**No code path writes `RawPath` or `PathEntries` directly.** Every PATH change goes through `Environment['PATH']` and then `RebuildPathEntries`.
+
+### 6.2 Environment comparer — single implementation
+
+```pascal
+function TEnvKeyComparer.Equals(const L, R: string): Boolean;
+begin
+  Result := CompareText(L, R) = 0;
+end;
+
+function TEnvKeyComparer.GetHashCode(const V: string): Integer;
+var
+  Lower: string;
+begin
+  Lower := LowerCase(V);   // Windows locale-aware lowercasing, matches CompareText folding
+  Result := 0;
+  for var Ch in Lower do
+    Result := Result * 31 + Ord(Ch);
+end;
+```
+
+Both `Equals` and `GetHashCode` use the same case-folding (`CompareText` and `LowerCase` are locale-consistent on Windows). Add a test with non-ASCII variable names (`PATH` with a Cyrillic prefix, e.g. `ПУТЬ` vs `путь`) to verify the hash/equality invariant holds.
+
+Every `TEnvironmentMap` (including `SetLocalStack` snapshots) must be constructed with this comparer.
+
+### 6.3 Registry management — `cmdx2 path` subcommands
+
+```pascal
+function ReadMachinePath(out APath: TRegistryPath): Boolean;
+function ReadUserPath(out APath: TRegistryPath): Boolean;
+
+function MergeAndExpand(
+  const AMachine, AUser: TRegistryPath;
+  out AMerged: string;
+  out AError: string): Boolean;
+// Expands each via ExpandEnvironmentStringsW, merges, dedups, validates length.
+
+function WriteUserPath(
+  const ANewRaw, AType: string;
+  out AError: string): Boolean;
+// Full sequence: read current, validate, write, verify, rollback on mismatch.
+
+function BackupUserPath(const ADir: string; out AFile: string): Boolean;
+function RestoreUserPath(const AFile: string; out AError: string): Boolean;
+procedure BroadcastEnvironmentChange;
+```
+
+`WriteUserPath` sequence:
+
+1. Read current user raw + type (buffer for rollback).
+2. Validate `Length(ANewRaw)` ≤ `CMDX2_ENV_VAR_LIMIT_CHARS`; refuse if exceeded.
+3. Warn if `Length(ANewRaw)` > `CMDX2_CMD_INHERIT_LIMIT_CHARS` (8191).
+4. `RegOpenKeyExW(HKCU, 'Environment', KEY_WRITE)`.
+5. `RegSetValueExW('Path', 0, AType, Data, (Length(ANewRaw)+1)*SizeOf(Char))`.
+6. `RegQueryValueExW('Path')`; string-compare to `ANewRaw`.
+7. On mismatch: `RegSetValueExW` with buffer; return failure.
+8. `BroadcastEnvironmentChange`.
+
+**After write, the caller must recompute the merged session PATH:**
+
+1. Read machine and (new) user raw.
+2. `MergeAndExpand`.
+3. `Environment['PATH'] := merged`.
+4. `RebuildPathEntries`.
+
+This is the fix for v4's defect: `cmdx2 path add` must not drop machine PATH from the session.
+
+`cmdx2 path` subcommands:
+
+| Command | Behavior |
+| :--- | :--- |
+| `cmdx2 path` | Print merged PATH, lengths, entry count |
+| `cmdx2 path list` | Numbered entries |
+| `cmdx2 path add "dir"` | Registry write per above |
+| `cmdx2 path remove "dir"` | Registry write per above |
+| `cmdx2 path check` | Duplicates, non-existent dirs, length warnings, expansion note |
+| `cmdx2 path backup [file]` | `.reg` export + JSON sidecar |
+| `cmdx2 path restore [file]` | Restore with verification |
+| `cmdx2 which <cmd>` | Full path, extension, PATH index |
+| `cmdx2 diagnose <cmd>` | Block size, ceiling, attempt launch, report |
+| `cmdx2 env-dump` | All variables with sizes |
+| `cmdx2 reload` | Re-read registry, replace session PATH |
+
+### 6.4 Per-drive CWD — three distinct operations
+
+| Operation | Effect |
+| :--- | :--- |
+| `D:` | Switch active drive to D; restore remembered directory for D (or root) |
+| `cd D:\path` | Set remembered directory on D; **do not switch active drive** |
+| `cd /d D:\path` | Set remembered directory on D **and** switch active drive |
+
+`PerDriveCwd: TDictionary<Char, string>` maps drive letter to remembered directory. Before every child launch, populate `=X:=<PerDriveCwd[X]>` entries into the environment block and remove stale `=X:` entries.
+
+`SetCurrentDirectoryW(ASession.Cwd)` is called whenever `Cwd` changes, so process CWD matches session CWD. This fixes the redirection-relative-path defect.
+
+### 6.5 Resolver cache invalidation
+
+Clear `ResolverCache` on:
+
+- Any `Environment['PATH']` change.
+- Any CWD change (`cd`, `chdir`, `pushd`, `popd`, drive switch).
+- `set PATHEXT=...`.
+- `set NoDefaultCurrentDirectoryInExePath=...` (or unset).
+- `cmdx2 reload`.
+
+### 6.6 `/c` and `/k` — raw tail preservation
+
+```pascal
+function GetRawCommandLineTail(const AFlag: string): string;
+// Walks GetCommandLineW; finds AFlag as a whole argument;
+// returns everything after the whitespace following AFlag, verbatim.
+```
+
+Behavior:
+
+- `cmdx2 /c <tail>`: execute `<tail>` once; exit with errorlevel.
+- `cmdx2 /c`: exit 0.
+- `cmdx2 /k <tail>`: execute `<tail>` once; enter REPL.
+- `cmdx2 /k`: enter REPL.
+- `cmdx2 <file.bat> [args]`: execute batch.
+
+### 6.7 Pipeline engine — corrected
+
+```
+function ExecutePipeline(Session, Stages: array of TParsedCommand): Integer
+  if Length(Stages) > 64 then Report('exceeds 64 stages'); Exit(9003)
+
+  // Create N-1 pipes; both ends inheritable; handle list restricts per child
+  for i := 0 to N-2 do
+    SA.nLength := SizeOf(SA); SA.bInheritHandle := True; SA.lpSecurityDescriptor := nil
+    if not CreatePipe(Pipes[i].Read, Pipes[i].Write, @SA, 0) then
+      CloseAll(Pipes, 0, i)
+      Exit(9001)
+
+  Processes := []
+  Success := False
+  try
+    for i := 0 to N-1 do
+      ChildIn  := (i = 0)   ? DupStdHandle(STD_INPUT)  : Pipes[i-1].Read
+      ChildOut := (i = N-1) ? DupStdHandle(STD_OUTPUT) : Pipes[i].Write
+      ChildErr := DupStdHandle(STD_ERROR)
+
+      // Apply stage redirects ONCE, here, in the caller
+      ApplyRedirects(Stages[i], ChildIn, ChildOut, ChildErr, OpenedByStage)
+
+      if not ResolveCommand(Session, Stages[i].ProgramName, Path, Ext, Idx) then
+        Report('not recognized'); Exit(9009)
+
+      // Launch with STARTUPINFOEX; pass already-final ChildIn/Out/Err
+      if not LaunchPrepared(Session, Path, Stages[i].Args,
+                            ChildIn, ChildOut, ChildErr, PI) then
+        Exit(9001)
+
+      Processes.Add(PI)
+    end
+    Success := True
+  finally
+    if not Success then
+      TerminateAndReap(Processes)   // direct children only
+    CloseAll(Pipes, 0, N-1)         // single close, tracked validity
+  end
+
+  WaitAll(Processes)                 // chunked if > 64
+  GetExitCodeProcess(Processes[N-1].hProcess, Result)
+  CloseAll(Processes)
+end
+```
+
+**Redirect application is done exactly once, by the caller.** `LaunchPrepared` does **not** apply redirects; it receives already-prepared handles. This fixes v4's double-apply defect.
+
+**Handle ownership:** every pipe handle is closed exactly once in the `finally`. `CloseAll` checks handle validity (tracks which were successfully created). `OpenedByStage` handles (from `ApplyRedirects`) are closed after `CreateProcessW` returns for that stage.
+
+**"No leaked processes" narrowed:** the guarantee is "no leaked direct pipeline children." Grandchildren spawned by a stage are the stage's responsibility. Documented as a divergence.
+
+**Builtins in pipelines:** first stage only. A builtin that writes to `Pipes[0].Write` must use an output abstraction (`IOutputStream`), not direct console writes. Later stages must be external programs.
+
+### 6.8 `LaunchWithExplicitBlock` — final signature
+
+```pascal
+function LaunchWithExplicitBlock(
+  const AExePath: string;
+  AArgs: TStringList;
+  const ARedirects: TList<TRedirectOp>;   // nil if handles pre-prepared
+  const APreparedIn, APreparedOut, APreparedErr: THandle;  // if ARedirects = nil
+  AEnvBlock: Pointer;
+  AWorkDir: string;
+  out AError: string
+): Boolean;
+```
+
+If `ARedirects <> nil`: applies redirects starting from duplicated standard handles. If `ARedirects = nil`: uses `APrepared*` handles directly (pipeline case). One or the other, never both.
+
+### 6.9 Redirection engine — ordered
+
+Applied in order:
+
+```pascal
+for Op in ARedirects do
+  case Op.Kind of
+    roToFile:
+      Access := Op.Append ? FILE_APPEND_DATA : GENERIC_WRITE
+      Disp   := Op.Append ? OPEN_ALWAYS : CREATE_ALWAYS
+      H := CreateFileW(ResolveAgainstCwd(Op.Target), Access, 0, @SA, Disp,
+                       FILE_ATTRIBUTE_NORMAL, 0)
+      AssignToDescriptor(Op.Source, H)   // rsStdout → Out, rsStderr → Err
+      OpenedHandles.Add(H)
+    roFromFile:
+      H := CreateFileW(ResolveAgainstCwd(Op.Target), GENERIC_READ, FILE_SHARE_READ,
+                       @SA, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0)
+      In := H; OpenedHandles.Add(H)
+    roToNul:
+      H := CreateFileW('NUL', GENERIC_WRITE, 0, @SA, OPEN_EXISTING,
+                       FILE_ATTRIBUTE_NORMAL, 0)
+      AssignToDescriptor(Op.Source, H); OpenedHandles.Add(H)
+    roDup:
+      if Op.Source = rsStderr then
+        if Op.Target = '1' then Err := Out else Err := Err   // 2>&1 / 2>&2
+      else if Op.Source = rsStdout then
+        if Op.Target = '2' then Out := Err else Out := Out   // 1>&2 / 1>&1
+  end
+```
+
+Order preserves semantics: `prog > out 2>&1` opens `out` first, then dups Out to Err. `prog 2>&1 > out` dups Out to Err first, then opens `out`. These differ correctly.
+
+`ResolveAgainstCwd` uses `ExpandFileName(Op.Target, ASession.Cwd)` — but since `SetCurrentDirectoryW` is kept synchronized (§6.4), the process CWD is already correct and `ExpandFileName` is redundant. Use `ExpandFileName` anyway for defense.
+
+### 6.10 Milestone C acceptance
+
+| Test | Expected |
+| :--- | :--- |
+| Registry PATH 20,000 → `cmdx2 /c cmdx2_pathtest.exe` | ≥ 20,000 |
+| Same with 32,767 | ≥ 32,767 |
+| Same with 32,768 | Refused; error |
+| Machine 20,000 + User 20,000 | Refused at startup |
+| `cmdx2 /c where.exe python` (long PATH) | Resolves |
+| `cmdx2 /c "echo a \| findstr a"` | Prints `a` |
+| `cmdx2 /c "echo a > out.txt 2>&1"` | `out.txt` contains `a` |
+| `cmdx2 /c "echo a 2>&1 > out.txt"` | `a` to console; `out.txt` empty |
+| `cmdx2 /c "echo err 2>err.txt"` | `err.txt` contains `err` |
+| `cmdx2 path add "G:\New"` → verify session | Merged PATH includes machine + new |
+| `cmdx2 path backup` → add → `path restore` | Byte-identical, type preserved |
+| Nested `set PATH=C:\X;%PATH%` → `cmdx2 /c cmdx2_pathtest.exe` | Override preserved |
+| `cd D:`, `cd C:`, `cd D:` cycles | PerDriveCwd correct |
+| `cd C:\Temp`, `echo hi > out.txt` | `C:\Temp\out.txt` created |
+| `cmdx2 /c "cmdx2_pathtest.exe \| findstr 20000"` | Prints `20000` |
+| Pipeline with 65 stages | Refused with error 9003 |
+| Command line > 32,766 chars | Refused with error 9002 |
+| Redirect cleanup: `prog > a.txt > b.txt` | Only `b.txt` written; `a.txt` created empty |
+| Pipeline launch failure at stage 2 | Stages 1 terminated; no leak; error returned |
+
+**End of Milestone C: the shell is a working launcher with pipes and redirection.**
+
+---
+
+## 7. Milestone D — Builtins, Batch, Corpus (10–14 weeks)
+
+### 7.1 Genuine builtins
+
+Implemented in `CmdX2Builtins.pas`:
+
+- **File/directory:** `dir`, `cd`, `chdir`, `md`, `mkdir`, `rd`, `rmdir`, `del`, `erase`, `copy`, `move`, `ren`, `rename`, `type`
+- **Environment/shell:** `set`, `path`, `prompt`, `title`, `color`, `cls`, `ver`, `vol`, `date`, `time`, `pause`, `exit`, `echo`, `shift`, `start`, `setlocal`, `endlocal`
+- **Control flow (batch context):** `if`, `else`, `for`, `goto`, `call`, `rem`, `::`
+- **Association:** `assoc`, `ftype`
+
+### 7.2 External programs (not builtins)
+
+`xcopy`, `attrib`, `more`, `tree`, `robocopy`, `find`, `findstr`, `where` — resolved from PATH.
+
+### 7.3 Batch interpreter
+
+`TBatchFrame` is a class with `ReturnStack: TStack<TBatchReturnPoint>`. `call :label` pushes `(Line, Arg0, Args copy)`; `exit /b` or `goto :eof` pops and restores.
+
+**Three distinct percent-expansion contexts:**
+
+1. **Command-level** (interactive or `/c`): `%%` → `%`, `%VAR%` → value, `%0`–`%9` → empty.
+2. **Batch-argument context** (in batch frame, outside `for`): `%%` → `%`, `%VAR%` → value, `%0`–`%9` → frame args, `%*` → frame args joined.
+3. **For-variable context** (inside `for` body): `%%X` → literal `%X` (placeholder), `%VAR%` → value.
+
+The batch frame's `DelayedExpansionState` gates `!VAR!` processing in all contexts.
+
+**Grouped execution:** `if`/`else` blocks and `for` bodies are represented as `TCommandNode` trees and executed recursively. Inside a group, delayed expansion is evaluated per-iteration, not at parse time.
+
+**`for` forms:** `for %%X in (...)`, `for /d`, `for /r`, `for /l`, `for /f` (documented behavior only).
+
+### 7.4 Batch encoding
+
+- UTF-8 BOM → UTF-8.
+- UTF-16 LE BOM → UTF-16 LE.
+- UTF-16 BE BOM → UTF-16 BE.
+- No BOM → ANSI (system code page).
+
+Documented.
+
+### 7.5 Milestone D acceptance
+
+20+ real `.bat` / `.cmd` files from SS64, common toolchains, npm-generated shims. Diff vs `cmd.exe`. Divergences limited to `DIVERGENCES.md`. npm test with `COMSPEC=cmdx2.exe`.
+
+---
+
+## 8. Schedule (Honest)
+
+| Milestone | Effort | Deliverable |
+| :--- | :--- | :--- |
+| **A — Inheritance proof** | **3–5 days** | **20,000-char PATH reaches native child** |
+| B — Parser rewrite | 1.5 weeks | Tokenizer + AST pass unit tests; redirect forms correct |
+| C — Registry + native exec + pipes + redirection | 3–4 weeks | Full Phase 2 functionality; acceptance tests pass |
+| D — Builtins + batch + corpus | 10–14 weeks | Daily driver; corpus passes |
+
+**Proof of mechanism (end of Milestone A): ~1 week from start.**
+**Working launcher with pipes and redirection (end of Milestone C): ~6–7 weeks.**
+**Daily driver (end of Milestone D): ~16–21 weeks.**
+
+---
+
+## 9. Test Suite
+
+### 9.1 Unit tests
+
+**Milestone A:** `WinQuoteArg` round-trips; `MergePath` dedup and length validation; block build round-trip; `=X:` preservation.
+
+**Milestone B:** every token kind; `2>&1` and `1>&2` produce correct token sequences; caret escapes; grouped parse; recursive AST construction.
+
+**Milestone C:** comparer hash/equality invariant (with non-ASCII); `RebuildPathEntries` from `Environment['PATH']`; registry round-trip with both `REG_SZ` and `REG_EXPAND_SZ`; rollback on verify failure; redirect ordering (`> out 2>&1` ≠ `2>&1 > out`); pipeline failure at stage k (all previous terminated, all handles closed, single error); command line > 32,766 → 9002; pipeline > 64 → 9003.
+
+**Milestone D:** batch arg substitution (three contexts); `call` return stack; `for` variable scoping; grouped `if`/`else` with nested commands; `setlocal` depth limit; delayed expansion timing.
+
+### 9.2 Integration tests
+
+| Test | Expected |
+| :--- | :--- |
+| 20K PATH → `cmdx2 /c cmdx2_pathtest.exe` | ≥ 20,000 |
+| Resolver proof: `cmdx2 /c where.exe python` (long PATH) | Resolves |
+| Registry round-trip: add, reopen, verify | Present |
+| Backup/restore | Byte-identical, type preserved |
+| Nested session preserves override | `cmdx2 /c echo %PATH%` shows override |
+| Pipe with long PATH | Resolves and prints |
+| Redirect ordering | Both orders work |
+| `cd C:\Temp`, `echo hi > out.txt` | `C:\Temp\out.txt` created |
+| Batch: `goto`, `if`, `for`, `call`, `setlocal` | Correct behavior |
+| Batch: grouped `if (...) else (...)` | Both branches execute correctly |
+| npm with `COMSPEC=cmdx2.exe` | Succeeds |
+
+### 9.3 Acceptance test corrections
+
+- Pipe tests must quote the full command: `cmdx2 /c "echo a | findstr a"`.
+- Environment inheritance and resolver tests are separate.
+- Registry rollback tested for: missing value, existing value, `REG_SZ` and `REG_EXPAND_SZ`, write failure, verify failure, restore.
+- Redirect cleanup tested for repeated redirects (`> a > b`) and for launch failure at each pipeline stage.
+
+---
+
+## 10. Success Criteria
+
+CmdX2 is complete when:
+
+1. A native child executed by `cmdx2 /c` receives a PATH of ≥ 20,000 chars via `GetEnvironmentVariableW`. **Primary proof.**
+2. Resolver finds an executable through the merged PATH independently of inheritance.
+3. `cmdx2 path add` writes, verifies, broadcasts, updates session (machine + user merged), reopens with the new entry.
+4. A 200-line batch script using `goto`, `if`, `for`, `call`, `setlocal`, grouped `if (...) else (...)` runs identically to `cmd.exe` aside from documented divergences.
+5. Native pipelines work with a 20,000-char PATH; no delegation.
+6. Redirections `<`, `>`, `>>`, `2>`, `2>>`, `2>&1`, `1>&2`, `>nul`, `2>nul` work in order.
+7. `cmdx2 path backup` / `restore` round-trip exactly; `REG_SZ` / `REG_EXPAND_SZ` type preserved.
+8. Nested sessions respect `CMDX2_SESSION` and `CMDX2_INHERIT_PATH`.
+9. `=C:` / `=D:` entries survive; `cd`/`cd /d`/`D:` semantics correct.
+10. Environment map case-insensitive.
+11. Regression corpus passes with divergences limited to `DIVERGENCES.md`.
+12. Command line > 32,766 chars refused; > 64 pipeline stages refused; merged PATH > 32,767 chars refused with component lengths in the error.
+
+---
+
+## 11. Divergences (`DIVERGENCES.md`)
+
+1. `cmd.exe` 8191-char inheritance limit does not apply to CmdX2 children.
+2. `cmd.exe` 4095-char GUI editor limit does not apply (registry writes bypass).
+3. Environment block ceiling is 32,767 chars per variable; total block unbounded.
+4. `for /f` tokenization matches documented behavior; undocumented quirks not reproduced.
+5. Builtins inside pipelines: first stage only.
+6. `%~` modifiers: `dp`, `f`, `nx`, `x`, `n`, `d`, `p` supported; `s`, `a`, `t`, `z` rejected.
+7. `setlocal` scoping matches `cmd.exe`; depth limit 32.
+8. `%ERRORLEVEL%` expansion matches `cmd.exe` except under `enabledelayedexpansion`.
+9. `cmd /c` with no command exits 0.
+10. `REG_EXPAND_SZ` expansion uses calling process environment; service-account launches may mis-expand user PATH.
+11. `cmdx2 path add` refuses values above 32,767 chars; no silent truncation.
+12. `ComSpec`-aware tools use CmdX2; tools hardcoding `System32\cmd.exe` bypass it.
+13. `start` with `/wait` waits; without, returns immediately.
+14. Pipeline stages after the first must be external.
+15. Batch encoding: UTF-8 BOM, UTF-16 BOM, or ANSI.
+16. Pipeline stage limit 64.
+17. No guarantee that pipeline grandchildren are terminated on stage failure.
+18. If and for grouped bodies are parsed as nodes, but the full syntactic `if`-as-group model is not implemented in v1; batch interpreter resolves grouping semantically.
+
+---
+
+## 12. Next Action
+
+**Begin Milestone A.** It is 3–5 days. It produces the proof that CmdX2 solves the original problem. Everything else builds on it. Do not begin Milestone B until Milestone A's acceptance tests pass.
+
+The order is fixed: **prove the mechanism, then build the shell.**
+
+---
+
+**End of Plan v5. Frozen. Implementation begins at Milestone A.**
