@@ -117,7 +117,10 @@ begin
     ASession.UserPathType := 'FILE';
     RebuildPathEntries(ASession);
     ASession.Environment.AddOrSetValue('CMDX2_SESSION', '1');
-    Writeln('PATH loaded from file (', Length(FilePath), ' chars)');
+    // No diagnostic output here. In /c mode, cmdx2 must print nothing
+    // to stdout on a successful launch. In interactive mode, the banner
+    // below reports the PATH source. A buffered write here would also
+    // interleave incorrectly with the child's output.
     Exit;
   end;
 

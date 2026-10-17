@@ -10,8 +10,13 @@ uses
   CmdX2Types, CmdX2Env, CmdX2Parser;
 
 const
-  CMDX2_EXTENDED_STARTUPINFO_PRESENT       = $00080000;
-  CMDX2_PROC_THREAD_ATTRIBUTE_HANDLE_LIST  = $00020016;
+  // EXTENDED_STARTUPINFO_PRESENT: documented Windows constant.
+  CMDX2_EXTENDED_STARTUPINFO_PRESENT = $00080000;
+
+  // PROC_THREAD_ATTRIBUTE_HANDLE_LIST = ProcThreadAttributeValue(2, FALSE, TRUE, FALSE)
+  //                                  = 2 | 0x00020000 = 0x00020002.
+  // (The previous value 0x00020016 was wrong: it encoded attribute 22, not 2.)
+  CMDX2_PROC_THREAD_ATTRIBUTE_HANDLE_LIST = $00020002;
 
 type
   TStartupInfoExLocal = record
@@ -124,6 +129,7 @@ function DupInheritableHandle(Source: THandle): THandle;
 begin
   Result := INVALID_HANDLE_VALUE;
   if Source = INVALID_HANDLE_VALUE then Exit;
+  if Source = 0 then Exit;  // NULL handle cannot be duplicated
   if not DuplicateHandle(GetCurrentProcess, Source, GetCurrentProcess,
     @Result, 0, True, DUPLICATE_SAME_ACCESS) then
     Result := INVALID_HANDLE_VALUE;
@@ -146,6 +152,7 @@ var
   AttrListSize: NativeUInt;
   PI: TProcessInformation;
   Handles: array[0..2] of THandle;
+  ValidHandleCount: Integer;
   HIn, HOut, HErr: THandle;
   OpenedHandles: TList<THandle>;
   SA: TSecurityAttributes;
@@ -159,10 +166,19 @@ var
       @SA, Disp, FILE_ATTRIBUTE_NORMAL, 0);
   end;
 
+  procedure AppendHandle(H: THandle);
+  begin
+    if H = INVALID_HANDLE_VALUE then Exit;
+    if H = 0 then Exit;
+    Handles[ValidHandleCount] := H;
+    Inc(ValidHandleCount);
+  end;
+
 begin
   Result := False;
   AError := '';
   AExitCode := 0;
+  ValidHandleCount := 0;
 
   FillChar(SIEX, SizeOf(SIEX), 0);
   FillChar(PI, SizeOf(PI), 0);
@@ -224,9 +240,13 @@ begin
         end;
       end;
 
-    Handles[0] := HIn;
-    Handles[1] := HOut;
-    Handles[2] := HErr;
+    // Build a compact list of valid handles only. The handle list
+    // attribute must contain valid, inheritable handles. Including
+    // INVALID_HANDLE_VALUE or NULL would cause the API to reject the
+    // array with ERROR_BAD_LENGTH or ERROR_INVALID_HANDLE.
+    AppendHandle(HIn);
+    AppendHandle(HOut);
+    AppendHandle(HErr);
 
     AttrList := nil;
     AttrListSize := 0;
@@ -240,17 +260,24 @@ begin
     try
       if not _InitProcThreadAttrList(AttrList, 1, 0, AttrListSize) then
       begin
-        AError := 'InitProcThreadAttrList failed';
+        AError := Format('InitProcThreadAttrList failed (err %d)', [GetLastError]);
         Exit;
       end;
       try
-        if not _UpdateProcThreadAttr(AttrList, 0,
-          CMDX2_PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-          @Handles[0], SizeOf(Handles), nil, nil) then
+        if ValidHandleCount > 0 then
         begin
-          AError := Format('UpdateProcThreadAttr failed (err %d)',
-            [GetLastError]);
-          Exit;
+          if not _UpdateProcThreadAttr(AttrList, 0,
+            CMDX2_PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+            @Handles[0],
+            NativeUInt(ValidHandleCount) * SizeOf(THandle),
+            nil, nil) then
+          begin
+            AError := Format(
+              'UpdateProcThreadAttr failed (err %d, handles: %d, size: %d)',
+              [GetLastError, ValidHandleCount,
+               NativeUInt(ValidHandleCount) * SizeOf(THandle)]);
+            Exit;
+          end;
         end;
 
         SIEX.StartupInfo.cb := SizeOf(SIEX);

@@ -51,15 +51,15 @@ REM   every execution path that reaches Step 1, so a registry change
 REM   will be reported even if a PATH check fails first.
 REM
 REM   Snapshot creation is fail-closed. If the BEFORE snapshot cannot
-REM   be established, the test aborts (exit 7) without running CmdX2.
-REM   If the AFTER snapshot cannot be established, the test reports a
-REM   critical failure (exit 6) rather than a pass. An unverifiable
-REM   registry state is never reported as "unchanged".
+REM   be established, the test aborts with exit code 7 without running
+REM   CmdX2. If the AFTER snapshot cannot be established, the test
+REM   reports a critical failure with exit code 6 rather than a pass.
+REM   An unverifiable registry state is never reported as "unchanged".
 REM
 REM   The comparison step distinguishes three fc.exe results:
 REM     errorlevel 0  = files identical  -> PASS
-REM     errorlevel 1  = files differ     -> FAIL (registry changed)
-REM     errorlevel 2  = comparison error -> FAIL (unverifiable)
+REM     errorlevel 1  = files differ     -> FAIL  registry changed
+REM     errorlevel 2  = comparison error -> FAIL  unverifiable
 REM   A comparison error is treated as a failure, not a pass.
 REM
 REM   When the snapshots differ, the test reports that the exported
@@ -84,15 +84,22 @@ REM   Cleanup failure is reported as a warning. A stuck temp file does
 REM   not change the test exit code, but the user is told the path so
 REM   it can be cleaned up manually.
 REM
+REM Cmd parser safety note:
+REM   No echo message inside a parenthesized if-block contains an
+REM   unescaped parenthesis. cmd.exe's block parser counts parens
+REM   naively and a stray ")" in echo text can close the block early,
+REM   turning later commands unconditional. This file deliberately
+REM   avoids such text.
+REM
 REM Exit codes:
 REM   0 = all checks passed
 REM   1 = cmdx2.exe or cmdx2_pathtest.exe not found
-REM   2 = setup failed (scratch dir or test file)
+REM   2 = setup failed: scratch dir or test file
 REM   3 = child PATH length check failed
-REM   4 = content check failed (truncation, insertion, or wrong PATH)
-REM   5 = PATH origin wrong (child PATH does not start with file entry)
+REM   4 = content check failed: truncation, insertion, or wrong PATH
+REM   5 = PATH origin wrong: child PATH does not start with file entry
 REM   6 = REGISTRY CHANGED DURING TEST, OR REGISTRY STATE UNVERIFIABLE
-REM   7 = BEFORE-SNAPSHOT FAILED (test aborted, not run)
+REM   7 = BEFORE-SNAPSHOT FAILED: test aborted, not run
 REM ============================================================
 
 setlocal
@@ -158,7 +165,7 @@ if not exist "%SCRATCH%\" (
     goto :cleanup
 )
 
-echo [INFO] Scratch:  %SCRATCH%  (created by this script)
+echo [INFO] Scratch:  %SCRATCH%  created by this script
 echo.
 
 set "BEFORE_REG=%SCRATCH%\before.reg"
@@ -167,7 +174,7 @@ set "TESTFILE=%SCRATCH%\testpath.txt"
 set "LENFILE=%SCRATCH%\len.txt"
 
 REM ============================================================
-REM Step 1: Snapshot HKCU\Environment BEFORE (fail-closed)
+REM Step 1: Snapshot HKCU\Environment BEFORE — fail-closed
 REM
 REM If we cannot establish a reliable baseline, we must not run
 REM the test at all. Running it would produce an unverifiable
@@ -213,10 +220,10 @@ if %BEFORE_SIZE% LSS 16 (
 )
 
 set "BEFORE=1"
-echo [STEP 1] PASS: HKCU\Environment snapshot successful (%BEFORE_SIZE% bytes)
+echo [STEP 1] PASS: HKCU\Environment snapshot successful %BEFORE_SIZE% bytes
 
 REM ============================================================
-REM Step 2: Build synthetic PATH file (~22,700 chars)
+REM Step 2: Build synthetic PATH file, approx 22700 chars
 REM ============================================================
 echo C:\Fake\CMDX2-TEST-FIRST-ENTRY>"%TESTFILE%"
 (for /L %%i in (1,1,1398) do @echo C:\Fake\Tool%%i)>>"%TESTFILE%"
@@ -238,7 +245,7 @@ if %FILESIZE% LSS 20000 (
     set "FAILCODE=2"
     goto :verify_registry
 )
-echo [STEP 2] PASS: test file created: %FILESIZE% bytes
+echo [STEP 2] PASS: test file created %FILESIZE% bytes
 
 REM ============================================================
 REM Step 3: Verify child receives long PATH
@@ -261,11 +268,11 @@ if errorlevel 1 (
     goto :verify_registry
 )
 if %LEN% LSS 20000 (
-    echo [FAIL] Child PATH length %LEN% ^< 20000
+    echo [FAIL] Child PATH length %LEN% is less than 20000
     set "FAILCODE=3"
     goto :verify_registry
 )
-echo [STEP 3] PASS: child PATH length %LEN% ^>= 20000
+echo [STEP 3] PASS: child PATH length %LEN% at least 20000
 
 REM ============================================================
 REM Step 4: Verify PATH content
@@ -273,11 +280,16 @@ REM   4a-c are fast canaries that give specific diagnostics on the
 REM   common failure modes. 4d is the exhaustive check: exact
 REM   string comparison against the expected PATH derived from the
 REM   input file.
+REM
+REM   Note: none of the echo messages below contain parentheses.
+REM   cmd.exe's block parser counts parens naively; an unescaped
+REM   ")" in echo text inside a parenthesized if-block can close
+REM   the block early and turn subsequent commands unconditional.
 REM ============================================================
 "%CMDX2%" --path-file "%TESTFILE%" /c "%PATHTEST%" check-start "C:\Fake\CMDX2-TEST-FIRST-ENTRY" >nul 2>&1
 if errorlevel 1 (
     echo [FAIL] First entry canary not at start of child PATH
-    echo       (PATH was not loaded from file, or was truncated at start)
+    echo        PATH was not loaded from file, or was truncated at start
     set "FAILCODE=5"
     goto :verify_registry
 )
@@ -285,8 +297,8 @@ echo [STEP 4a] PASS: child PATH starts with file's first entry
 
 "%CMDX2%" --path-file "%TESTFILE%" /c "%PATHTEST%" check ";C:\Fake\Tool700;" >nul 2>&1
 if errorlevel 1 (
-    echo [FAIL] Middle entry canary (Tool700) not present in child PATH
-    echo       (PATH was truncated)
+    echo [FAIL] Middle entry canary Tool700 not present in child PATH
+    echo        PATH was truncated
     set "FAILCODE=4"
     goto :verify_registry
 )
@@ -295,7 +307,7 @@ echo [STEP 4b] PASS: middle entry present in child PATH
 "%CMDX2%" --path-file "%TESTFILE%" /c "%PATHTEST%" check-end "C:\Fake\CMDX2-TEST-LAST-ENTRY" >nul 2>&1
 if errorlevel 1 (
     echo [FAIL] Last entry canary not at end of child PATH
-    echo       (PATH was truncated at end, or extra entries were appended)
+    echo        PATH was truncated at end, or extra entries were appended
     set "FAILCODE=4"
     goto :verify_registry
 )
@@ -307,7 +319,7 @@ REM fail this check.
 "%CMDX2%" --path-file "%TESTFILE%" /c "%PATHTEST%" check-file "%TESTFILE%"
 if errorlevel 1 (
     echo [FAIL] Child PATH does not exactly match input file
-    echo       (diagnostic above shows first differing position)
+    echo        diagnostic above shows first differing position
     set "FAILCODE=4"
     goto :verify_registry
 )
@@ -321,7 +333,7 @@ REM because a registry change is the most important concern.
 REM ============================================================
 :verify_registry
 
-REM --- Step 5: Snapshot HKCU\Environment AFTER (fail-closed) ---
+REM --- Step 5: Snapshot HKCU\Environment AFTER — fail-closed ---
 reg query "HKCU\Environment" >nul 2>&1
 if errorlevel 1 (
     echo [CRITICAL] HKCU\Environment disappeared or became inaccessible.
@@ -358,14 +370,14 @@ if %AFTER_SIZE% LSS 16 (
 )
 
 set "AFTER=1"
-echo [STEP 5] PASS: HKCU\Environment snapshot successful (%AFTER_SIZE% bytes)
+echo [STEP 5] PASS: HKCU\Environment snapshot successful %AFTER_SIZE% bytes
 
 REM --- Step 6: Compare before/after ---
 REM
 REM fc.exe errorlevels:
 REM   0 = files identical
-REM   1 = files differ (registry changed)
-REM   2 = comparison error (cannot determine)
+REM   1 = files differ, registry changed
+REM   2 = comparison error, cannot determine
 REM
 REM Check errorlevel 2 FIRST. A comparison error means we cannot
 REM tell whether the registry changed. That must never be reported
@@ -435,7 +447,7 @@ goto :report_fail
 :report_fail
 echo.
 echo ============================================================
-echo TEST FAILED (exit code %FAILCODE%)
+echo TEST FAILED, exit code %FAILCODE%
 echo ============================================================
 echo   Scratch directory: %SCRATCH%
 goto :cleanup
@@ -449,7 +461,7 @@ echo   Child PATH length:  %LEN% chars
 echo   First entry:        present at start
 echo   Middle entry:       present
 echo   Last entry:         present at end
-echo   Exact match:        child PATH == input file contents
+echo   Exact match:        child PATH matches input file contents
 echo   Registry:           exported contents of HKCU\Environment unchanged
 echo.
 
