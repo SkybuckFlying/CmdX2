@@ -52,6 +52,7 @@ function LaunchWithExplicitBlock(
   const ARedirects: TList<TRedirectOp>;
   AEnvBlock: Pointer;
   AWorkDir: string;
+  out AExitCode: DWORD;
   out AError: string): Boolean;
 function LaunchProcessDirect(ASession: TSession; const AExePath: string;
   AArgs: TStringList; const ARedirects: TList<TRedirectOp>): Integer;
@@ -134,6 +135,7 @@ function LaunchWithExplicitBlock(
   const ARedirects: TList<TRedirectOp>;
   AEnvBlock: Pointer;
   AWorkDir: string;
+  out AExitCode: DWORD;
   out AError: string): Boolean;
 var
   CmdLineStr: string;
@@ -160,6 +162,7 @@ var
 begin
   Result := False;
   AError := '';
+  AExitCode := 0;
 
   FillChar(SIEX, SizeOf(SIEX), 0);
   FillChar(PI, SizeOf(PI), 0);
@@ -284,6 +287,7 @@ begin
           end;
 
           WaitForSingleObject(PI.hProcess, INFINITE);
+          GetExitCodeProcess(PI.hProcess, AExitCode);
           CloseHandle(PI.hProcess);
           CloseHandle(PI.hThread);
           Result := True;
@@ -310,6 +314,7 @@ var
   BlockPtr: Pointer;
   BlockSize: Int64;
   BlockError, LaunchError: string;
+  ChildExit: DWORD;
   K: string;
 begin
   Result := 9009;
@@ -328,15 +333,15 @@ begin
     end;
     try
       if not LaunchWithExplicitBlock(AExePath, AArgs, ARedirects, BlockPtr,
-        ASession.Cwd, LaunchError) then
+        ASession.Cwd, ChildExit, LaunchError) then
       begin
         Writeln(ErrOutput, Format('Error launching "%s": %s',
           [ExtractFileName(AExePath), LaunchError]));
         ASession.ErrorLevel := 9001;
         Exit(9001);
       end;
-      Result := 0;
-      ASession.ErrorLevel := 0;
+      Result := Integer(ChildExit);
+      ASession.ErrorLevel := Result;
     finally
       FreeEnvironmentBlockUTF16(BlockPtr);
     end;

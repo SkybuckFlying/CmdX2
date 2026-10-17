@@ -11,18 +11,43 @@ uses
 function GetRawCommandLineTail(const AFlag: string): string;
 var
   CmdLine, LowerCmd, LowerFlag: string;
-  FlagPos, TailStart: Integer;
+  I, TailStart: Integer;
+  InQuote: Boolean;
 begin
   Result := '';
   CmdLine := GetCommandLineW;
   LowerCmd := LowerCase(CmdLine);
   LowerFlag := LowerCase(AFlag);
-  FlagPos := Pos(LowerFlag, LowerCmd);
-  if FlagPos = 0 then Exit;
-  TailStart := FlagPos + Length(AFlag);
-  while (TailStart <= Length(CmdLine)) and (CmdLine[TailStart] = ' ') do
-    Inc(TailStart);
-  Result := Copy(CmdLine, TailStart, Length(CmdLine) - TailStart + 1);
+
+  InQuote := False;
+  I := 1;
+  while I <= Length(LowerCmd) do
+  begin
+    if LowerCmd[I] = '"' then
+    begin
+      InQuote := not InQuote;
+      Inc(I);
+      Continue;
+    end;
+    if InQuote then
+    begin
+      Inc(I);
+      Continue;
+    end;
+    if (I + Length(LowerFlag) - 1 <= Length(LowerCmd)) and
+       (Copy(LowerCmd, I, Length(LowerFlag)) = LowerFlag) and
+       ((I = 1) or (LowerCmd[I - 1] = ' ')) and
+       ((I + Length(LowerFlag) > Length(LowerCmd)) or
+        (LowerCmd[I + Length(LowerFlag)] = ' ')) then
+    begin
+      TailStart := I + Length(LowerFlag);
+      while (TailStart <= Length(CmdLine)) and (CmdLine[TailStart] = ' ') do
+        Inc(TailStart);
+      Result := Copy(CmdLine, TailStart, Length(CmdLine) - TailStart + 1);
+      Exit;
+    end;
+    Inc(I);
+  end;
 end;
 
 function StripQuotes(const S: string): string;
@@ -32,11 +57,70 @@ begin
     Result := Copy(Result, 2, Length(Result) - 2);
 end;
 
-procedure LoadStartupPath(ASession: TSession);
+function LoadPathFromFile(const AFileName: string; out APath, AError: string): Boolean;
+var
+  SL: TStringList;
+  I: Integer;
+begin
+  Result := False;
+  APath := '';
+  AError := '';
+  if not FileExists(AFileName) then
+  begin
+    AError := 'Path file not found: ' + AFileName;
+    Exit;
+  end;
+  SL := TStringList.Create;
+  try
+    try
+      SL.LoadFromFile(AFileName);
+    except
+      on E: Exception do
+      begin
+        AError := 'Cannot read path file: ' + E.Message;
+        Exit;
+      end;
+    end;
+    for I := 0 to SL.Count - 1 do
+    begin
+      if Trim(SL[I]) = '' then Continue;
+      if APath <> '' then APath := APath + ';';
+      APath := APath + Trim(SL[I]);
+    end;
+    if Length(APath) > CMDX2_ENV_VAR_LIMIT_CHARS then
+    begin
+      AError := Format('Path file content is %d chars; exceeds %d',
+        [Length(APath), CMDX2_ENV_VAR_LIMIT_CHARS]);
+      Exit;
+    end;
+    Result := True;
+  finally
+    SL.Free;
+  end;
+end;
+
+procedure LoadStartupPath(ASession: TSession; const APathFile: string);
 var
   MachinePath, UserPath: TRegistryPath;
-  Merged, Err, InheritedPath: string;
+  Merged, Err, InheritedPath, FilePath, FileErr: string;
 begin
+  if APathFile <> '' then
+  begin
+    if not LoadPathFromFile(APathFile, FilePath, FileErr) then
+    begin
+      Writeln(ErrOutput, FileErr);
+      ASession.ErrorLevel := 9001;
+      Exit;
+    end;
+    ASession.Environment.AddOrSetValue('PATH', FilePath);
+    ASession.UserRawPath := FilePath;
+    ASession.UserPathType := 'FILE';
+    RebuildPathEntries(ASession);
+    ASession.Environment.AddOrSetValue('CMDX2_SESSION', '1');
+    Writeln('PATH loaded from file (', Length(FilePath), ' chars)');
+    Exit;
+  end;
+
   if ASession.Environment.TryGetValue('CMDX2_SESSION', InheritedPath) then
     if ASession.Environment.TryGetValue('PATH', InheritedPath) and (InheritedPath <> '') then
     begin
@@ -124,15 +208,40 @@ end;
 
 var
   Session: TSession;
-  Tail, Cmd: string;
+  Tail, Cmd, PathFile: string;
+  HasSlashC: Boolean;
+  I: Integer;
 begin
+  PathFile := '';
+  HasSlashC := False;
+  I := 1;
+  while I <= ParamCount do
+  begin
+    if SameText(ParamStr(I), '--path-file') then
+    begin
+      if I < ParamCount then
+      begin
+        PathFile := ParamStr(I + 1);
+        Inc(I);
+      end
+      else
+      begin
+        Writeln(ErrOutput, '--path-file requires a value');
+        Halt(1);
+      end;
+    end
+    else if SameText(ParamStr(I), '/c') then
+      HasSlashC := True;
+    Inc(I);
+  end;
+
   try
     Session := TSession.Create;
     try
       LoadCurrentEnvironment(Session);
-      LoadStartupPath(Session);
+      LoadStartupPath(Session, PathFile);
 
-      if (ParamCount >= 1) and SameText(ParamStr(1), '/c') then
+      if HasSlashC then
       begin
         Tail := GetRawCommandLineTail('/c');
         if Tail = '' then Halt(0);
@@ -141,8 +250,11 @@ begin
       end;
 
       Writeln('CmdX2 [Milestone A]');
+      if PathFile <> '' then
+        Writeln('PATH source: file (', PathFile, ')')
+      else
+        Writeln('PATH source: registry (merged)');
       Writeln('PATH length (in-memory): ', Length(Session.RawPath), ' chars');
-      Writeln('Try:  cmdx2 /c cmdx2_pathtest.exe');
       Writeln('Type "exit" to quit.');
       Writeln;
 
