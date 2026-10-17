@@ -1,4 +1,4 @@
-﻿program TestCmdX2;
+program TestCmdX2;
 
 {$APPTYPE CONSOLE}
 {$IFDEF FPC}{$MODE DELPHI}{$ENDIF}
@@ -46,7 +46,7 @@ var
 begin
   Toks := Tokenize('echo hello');
   try
-    Check('echo hello → 2 words', (Toks.Count = 2)
+    Check('echo hello -> 2 words', (Toks.Count = 2)
       and (Toks[0].Kind = tkWord) and (Toks[0].Text = 'echo'));
   finally
     Toks.Free;
@@ -55,7 +55,9 @@ begin
   Toks := Tokenize('echo a 2>&1');
   try
     Check('2>&1 tokenized',
-      (Toks.Count = 4) and (Toks[3].Kind = tkRedirectDupErr));
+      (Toks.Count = 4)
+      and (Toks[2].Kind = tkRedirectDupErr)
+      and (Toks[3].Text = '1'));
   finally
     Toks.Free;
   end;
@@ -63,7 +65,9 @@ begin
   Toks := Tokenize('echo a 1>&2');
   try
     Check('1>&2 tokenized',
-      (Toks.Count = 4) and (Toks[3].Kind = tkRedirectDupOut));
+      (Toks.Count = 4)
+      and (Toks[2].Kind = tkRedirectDupOut)
+      and (Toks[3].Text = '2'));
   finally
     Toks.Free;
   end;
@@ -89,7 +93,7 @@ end;
 
 procedure TestQuoteArg;
 begin
-  Check('QuoteArg empty → ""', WinQuoteArg('') = '""');
+  Check('QuoteArg empty -> ""', WinQuoteArg('') = '""');
   Check('QuoteArg simple', WinQuoteArg('abc') = 'abc');
   Check('QuoteArg with space', WinQuoteArg('a b') = '"a b"');
   Check('QuoteArg trailing slash', WinQuoteArg('a b\') = '"a b\\"');

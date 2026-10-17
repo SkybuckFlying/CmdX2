@@ -29,7 +29,7 @@ begin
     (Cmd = 'call') or (Cmd = 'goto') or (Cmd = 'start') or (Cmd = 'assoc') or
     (Cmd = 'ftype') or (Cmd = 'setlocal') or (Cmd = 'endlocal') or
     (Cmd = 'pushd') or (Cmd = 'popd') or (Cmd = 'if') or (Cmd = 'else') or
-    (Cmd = 'for') or (Cmd = 'rem') or (Cmd = 'cmdx2');
+    (Cmd = 'for') or (Cmd = 'rem');
 end;
 
 function TryFind(const ABase: string; ASession: TSession; out APath: string): Boolean;
